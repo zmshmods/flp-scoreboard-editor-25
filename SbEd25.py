@@ -649,11 +649,23 @@ def import_texture():
 
     bigfile = FifaBigFile(file_path)
     file_name = image_files[current_image_index]  # Use the currently previewed file
-    new_file_path = filedialog.askopenfilename(filetypes=[("DDS Files", "*.dds")])
+    new_file_path = filedialog.askopenfilename(filetypes=[("DDS Files", "*.dds"), ("PNG Files", "*.png")])
     if not new_file_path:
         return
 
     try:
+        if new_file_path.lower().endswith(".png"):
+            try:
+                image = Image.open(new_file_path)
+                image = image.convert("RGBA")  # Convert to BGRA8888 format
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_dds_file:
+                    temp_dds_path = temp_dds_file.name
+                    image.save(temp_dds_path, "DDS")
+                    new_file_path = temp_dds_path
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to convert PNG to DDS: {e}")
+                return
+
         with open(new_file_path, 'rb') as new_file:
             new_data = new_file.read()
 
