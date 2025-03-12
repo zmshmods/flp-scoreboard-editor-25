@@ -1,0 +1,40 @@
+{
+  "5002": {
+    "offsets": {
+      "Home Team Name X": "0x470C",
+      "Home Team Name Y": "0x4710",
+      "Away Team Name X": "0x475C",
+      "Away Team Name Y": "0x4760",
+      "Home Score X": "0x47AC",
+      "Home Score Y": "0x47B0",
+      "Score Seperator X": "0x484C",
+      "Score Seperator Y": "0x4850",
+      "Away Score X": "0x47FC",
+      "Away Score Y": "0x4800",
+      "Time Text X": "0x489C",
+      "Time Text Y": "0x48A0",
+      "Added Time X": "0x4A7C",
+      "Added Time Y": "0x4A80",
+      "Home Color Bar X": "0x4CAC",
+      "Home Color Bar Y": "0x4CB0",
+      "Away Color Bar X": "0x4CFC",
+      "Away Color Bar Y": "0x4D00",
+      "Full Scoreboard X": "0x1B9C",
+      "Full Scoreboard Y": "0x1BA0",
+      "Home Team Name Size": "0xB04",
+      "Away Team Name Size": "0xB64",
+      "Home Score Size": "0xBFC",
+      "Away Score Size": "0xCBC",
+      "Score Seperator Size": "0xC5C",
+      "Time Text Size": ["0xD1C", "0xD7C", "0xDDC", "0xE3C", "0xE9C", "0xEFC"]
+    },
+    "colors": {
+      "Home Team Name Color": "0xB00",
+      "Away Team Name Color": "0xB60",
+      "Home Score Color": "0xBF8",
+      "Away Score Color": "0xCB8",
+      "Score Seperator Color": "0xC58",
+      "Time Text Color": ["0xD18", "0xD78", "0xDD8", "0xE38", "0xE98", "0xEF8"]
+    }
+  }
+}
