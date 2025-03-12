@@ -7,6 +7,10 @@ import os
 import tempfile
 from PIL import Image, ImageTk
 import json
+import logging
+from dataclasses import dataclass
+from enum import Enum
+from typing import List
 
 # Load offsets from JSON file
 with open('offsets.json', 'r') as f:
@@ -21,62 +25,143 @@ previous_file_path = None
 previous_offsets_values = {}
 previous_color_values = {}
 
+class Compression(Enum):
+    NONE = "None"
+    EAHD = "EAHD"
+
+@dataclass
+class FileEntry:
+    offset: int
+    size: int
+    name: str
+    file_type: str
+    compression: Compression
+    data: bytes
+
+class BinaryReader:
+    def __init__(self, data: bytearray):
+        self.data = data
+        self.pos = 0
+
+    def read_byte(self) -> int:
+        if self.pos >= len(self.data):
+            raise ValueError("End of stream reached")
+        value = self.data[self.pos]
+        self.pos += 1
+        return value
+
+    def read_int(self, bytes_count: int = 4, big_endian: bool = False) -> int:
+        chunk = self.data[self.pos:self.pos + bytes_count]
+        self.pos += bytes_count
+        return int.from_bytes(chunk, "big" if big_endian else "little")
+
+    def read_string(self, encoding: str) -> str:
+        start = self.pos
+        while self.pos < len(self.data) and self.data[self.pos] != 0:
+            self.pos += 1
+        result = self.data[start:self.pos].decode(encoding, errors="ignore")
+        self.pos += 1  # Skip null terminator
+        return result
+
+    def skip(self, count: int):
+        self.pos += count
+
+class Decompressor:
+    @staticmethod
+    def detect_compression(data: bytes) -> Compression:
+        """Detect if data uses EAHD compression based on the first two bytes."""
+        return Compression.EAHD if len(data) >= 2 and data[:2] == b"\xfb\x10" else Compression.NONE
+
+    @staticmethod
+    def decompress_eahd(data: bytes) -> bytes:
+        """Decompress EAHD-compressed data."""
+        try:
+            reader = BinaryReader(bytearray(data))
+            if reader.read_int(2, True) != 0xFB10:
+                return data
+
+            total_size = reader.read_int(3, True)
+            output = bytearray(total_size)
+            pos = 0
+
+            while reader.pos < len(reader.data):
+                ctrl = reader.read_byte()
+
+                if ctrl < 0x80:  # Short copy
+                    a = reader.read_byte()
+                    to_read = ctrl & 0x03
+                    to_copy = ((ctrl & 0x1C) >> 2) + 3
+                    offset = ((ctrl & 0x60) << 3) + a + 1
+                elif ctrl < 0xC0:  # Medium copy
+                    a, b = reader.read_byte(), reader.read_byte()
+                    to_read = (a >> 6) & 0x03
+                    to_copy = (ctrl & 0x3F) + 4
+                    offset = ((a & 0x3F) << 8) + b + 1
+                elif ctrl < 0xE0:  # Long copy
+                    a, b, c = reader.read_byte(), reader.read_byte(), reader.read_byte()
+                    to_read = ctrl & 0x03
+                    to_copy = ((ctrl & 0x0C) << 6) + c + 5
+                    offset = ((ctrl & 0x10) << 12) + (a << 8) + b + 1
+                elif ctrl < 0xFC:  # Large read
+                    to_read = ((ctrl & 0x1F) << 2) + 4
+                    to_copy = 0
+                    offset = 0
+                else:  # Small read
+                    to_read = ctrl & 0x03
+                    to_copy = 0
+                    offset = 0
+
+                for _ in range(to_read):
+                    output[pos] = reader.read_byte()
+                    pos += 1
+
+                copy_start = pos - offset
+                for _ in range(to_copy):
+                    output[pos] = output[copy_start]
+                    pos += 1
+                    copy_start += 1
+
+            return bytes(output[:pos])
+        except Exception as e:
+            logging.error(f"ERROR: EAHD decompression failed - {e}")
+            return data
+
 class FifaBigFile:
     def __init__(self, filename):
         self.filename = filename
-        self.n_files = 0
-        self.headers = []
-        self.files = []
-        self.end_signature = None
-        self.alignment = 16
-        self.total_file_size = 0
-        self.header_size = 0
-        self.modified = False
+        self.entries: List[FileEntry] = []
+        self._load()
 
+    def _load(self):
         with open(self.filename, 'rb') as f:
-            self._load(f)
+            self.data = bytearray(f.read())
 
-    def _read_int32(self, f):
-        return struct.unpack('<I', f.read(4))[0]
+        reader = BinaryReader(self.data)
+        magic = bytes(self.data[:4])
+        reader.skip(4)  # Skip magic
+        total_data_size = reader.read_int(4, False)
+        num_entries = reader.read_int(4, True)
+        unknown_offset = reader.read_int(4, True)
 
-    def _load(self, f):
-        magic = f.read(4).decode('ascii')
-        if magic not in ('BIGF', 'BIG4'):
-            raise ValueError("Invalid BIG file format")
+        current_type = "DAT"
+        for _ in range(num_entries):
+            offset = reader.read_int(4, True)
+            size = reader.read_int(4, True)
+            name = reader.read_string('utf-8')
 
-        self.total_file_size = self._read_int32(f)
-        self.n_files = self._swap_endian(self._read_int32(f))
-        self.header_size = self._swap_endian(self._read_int32(f))
+            if size == 0 and name in {"sg1", "sg2"}:
+                current_type = {"sg1": "DDS", "sg2": "APT"}[name]
+                self.entries.append(FileEntry(offset, size, name, current_type, Compression.NONE, b""))
+                continue
 
-        for _ in range(self.n_files):
-            start_pos = self._swap_endian(self._read_int32(f))
-            size = self._swap_endian(self._read_int32(f))
-            name = self._read_null_terminated_string(f)
-            self.headers.append((start_pos, size, name))
+            raw_data = bytes(self.data[offset:offset + size])
+            compression = Decompressor.detect_compression(raw_data)
+            data = Decompressor.decompress_eahd(raw_data) if compression == Compression.EAHD else raw_data
 
-        if self.header_size == f.tell() + 8:
-            self.end_signature = f.read(8)
-
-        self.alignment = self._estimate_alignment()
-
-    def _swap_endian(self, value):
-        return struct.unpack('<I', struct.pack('>I', value))[0]
-
-    def _read_null_terminated_string(self, f):
-        name_bytes = bytearray()
-        while (byte := f.read(1)) != b'\x00':
-            name_bytes.extend(byte)
-        return name_bytes.decode('ascii')
-
-    def _estimate_alignment(self):
-        alignments = [self._compute_alignment(start_pos) for start_pos, _, _ in self.headers]
-        return min(alignments) if alignments else 16
-
-    def _compute_alignment(self, position):
-        return 2 ** (position.bit_length() - 1)
+            self.entries.append(FileEntry(offset, len(data), name, current_type, compression, data))
 
     def list_files(self):
-        return [name for _, _, name in self.headers]
+        return [entry.name for entry in self.entries if entry.size > 0]
 
     def detect_file_type(self, data):
         if data[:4] == b'DDS ':
@@ -84,40 +169,38 @@ class FifaBigFile:
         return ""
 
     def export_file(self, file_name):
-        with open(self.filename, 'rb') as f:
-            for start_pos, size, name in self.headers:
-                if name == file_name:
-                    f.seek(start_pos)
-                    data = f.read(size)
-                    file_type = self.detect_file_type(data)
+        for entry in self.entries:
+            if entry.name == file_name:
+                data = entry.data
+                file_type = self.detect_file_type(data)
 
-                    output_path = filedialog.asksaveasfilename(
-                        defaultextension="",
-                        filetypes=[("All Files", "*.*")],
-                        initialfile=os.path.basename(name)
-                    )
-                    if not output_path:
-                        return
-
-                    if file_type == "[DDS]":
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_file:
-                            temp_dds_path = temp_file.name
-                            temp_file.write(data)
-
-                        try:
-                            image = Image.open(temp_dds_path)
-                            image.save(output_path, "PNG")
-                            messagebox.showinfo("Success", f"Exported {file_name} as PNG to {output_path}")
-                        except Exception as e:
-                            messagebox.showerror("Error", f"Failed to convert DDS to PNG: {e}")
-                        finally:
-                            if os.path.exists(temp_dds_path):
-                                os.remove(temp_dds_path)
-                    else:
-                        with open(output_path, 'wb') as out_f:
-                            out_f.write(data)
-                        messagebox.showinfo("Success", f"Exported {file_name} to {output_path}")
+                output_path = filedialog.asksaveasfilename(
+                    defaultextension="",
+                    filetypes=[("All Files", "*.*")],
+                    initialfile=os.path.basename(file_name)
+                )
+                if not output_path:
                     return
+
+                if file_type == "[DDS]":
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_file:
+                        temp_dds_path = temp_file.name
+                        temp_file.write(data)
+
+                    try:
+                        image = Image.open(temp_dds_path)
+                        image.save(output_path, "PNG")
+                        messagebox.showinfo("Success", f"Exported {file_name} as PNG to {output_path}")
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to convert DDS to PNG: {e}")
+                    finally:
+                        if os.path.exists(temp_dds_path):
+                            os.remove(temp_dds_path)
+                else:
+                    with open(output_path, 'wb') as out_f:
+                        out_f.write(data)
+                    messagebox.showinfo("Success", f"Exported {file_name} to {output_path}")
+                return
         messagebox.showerror("Error", "File not found")
 
     def import_texture(self, file_name, new_file_path):
@@ -136,19 +219,18 @@ class FifaBigFile:
         with open(new_file_path, 'rb') as new_file:
             new_data = new_file.read()
 
-        with open(self.filename, 'r+b') as f:
-            for i, (start_pos, size, name) in enumerate(self.headers):
-                if name == file_name:
-                    if len(new_data) > size:
-                        messagebox.showerror("Error", "New file is larger than the original")
-                        return
-                    f.seek(start_pos)
-                    f.write(new_data)
-                    if len(new_data) < size:
-                        f.write(b'\x00' * (size - len(new_data)))
-                    self.modified = True
-                    messagebox.showinfo("Success", f"Imported {file_name}")
+        for entry in self.entries:
+            if entry.name == file_name:
+                if len(new_data) > entry.size:
+                    messagebox.showerror("Error", "New file is larger than the original")
                     return
+                with open(self.filename, 'r+b') as f:
+                    f.seek(entry.offset)
+                    f.write(new_data)
+                    if len(new_data) < entry.size:
+                        f.write(b'\x00' * (entry.size - len(new_data)))
+                messagebox.showinfo("Success", f"Imported {file_name}")
+                return
         messagebox.showerror("Error", "File not found in BIG file")
 
 def read_internal_name(file_path):
@@ -577,9 +659,9 @@ def import_texture():
 
         # Check the size of the original file
         original_size = None
-        for start_pos, size, name in bigfile.headers:
-            if name == file_name:
-                original_size = size
+        for entry in bigfile.entries:
+            if entry.name == file_name:
+                original_size = entry.size
                 break
 
         if original_size is None:
@@ -591,12 +673,12 @@ def import_texture():
             return
 
         with open(bigfile.filename, 'r+b') as f:
-            for i, (start_pos, size, name) in enumerate(bigfile.headers):
-                if name == file_name:
-                    f.seek(start_pos)
+            for entry in bigfile.entries:
+                if entry.name == file_name:
+                    f.seek(entry.offset)
                     f.write(new_data)
-                    if len(new_data) < size:
-                        f.write(b'\x00' * (size - len(new_data)))
+                    if len(new_data) < entry.size:
+                        f.write(b'\x00' * (entry.size - len(new_data)))
                     bigfile.modified = True
                     messagebox.showinfo("Success", f"Imported {file_name}")
 
@@ -646,32 +728,30 @@ def export_selected_file():
     if not export_format:
         return
 
-    with open(bigfile.filename, 'rb') as f:
-        for start_pos, size, name in bigfile.headers:
-            if name == file_name:
-                f.seek(start_pos)
-                data = f.read(size)
-                file_type = bigfile.detect_file_type(data)
+    for entry in bigfile.entries:
+        if entry.name == file_name:
+            data = entry.data
+            file_type = bigfile.detect_file_type(data)
 
-                if file_type == "[DDS]":
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_file:
-                        temp_dds_path = temp_file.name
-                        temp_file.write(data)
+            if file_type == "[DDS]":
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_file:
+                    temp_dds_path = temp_file.name
+                    temp_file.write(data)
 
-                    try:
-                        image = Image.open(temp_dds_path)
-                        image.save(export_format, "PNG")
-                        messagebox.showinfo("Success", f"Exported {file_name} as PNG to {export_format}")
-                    except Exception as e:
-                        messagebox.showerror("Error", f"Failed to convert DDS to PNG: {e}")
-                    finally:
-                        if os.path.exists(temp_dds_path):
-                            os.remove(temp_dds_path)
-                else:
-                    with open(export_format, 'wb') as out_f:
-                        out_f.write(data)
-                    messagebox.showinfo("Success", f"Exported {file_name} to {export_format}")
-                return
+                try:
+                    image = Image.open(temp_dds_path)
+                    image.save(export_format, "PNG")
+                    messagebox.showinfo("Success", f"Exported {file_name} as PNG to {export_format}")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to convert DDS to PNG: {e}")
+                finally:
+                    if os.path.exists(temp_dds_path):
+                        os.remove(temp_dds_path)
+            else:
+                with open(export_format, 'wb') as out_f:
+                    out_f.write(data)
+                messagebox.showinfo("Success", f"Exported {file_name} to {export_format}")
+            return
     messagebox.showerror("Error", "File not found")
 
 def previous_image():
