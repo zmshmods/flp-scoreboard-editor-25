@@ -252,10 +252,11 @@ def read_internal_name(file_path):
         return None
 
 def open_file():
-    global file_path, current_image
+    global file_path, current_image, current_image_index
     file_path = filedialog.askopenfilename(filetypes=[("FIFA Big Files", "*.big")])
     
     if file_path:
+        current_image_index = 0  # Reset the image index to 0
         update_status(f"File Loaded: {file_path}", "blue")
         add_internal_name()
         load_current_values()
@@ -734,7 +735,7 @@ def export_selected_file():
     # Ask the user for the export format
     export_format = filedialog.asksaveasfilename(
         defaultextension=".png",
-        filetypes=[("PNG Files", "*.png")],
+        filetypes=[("PNG Files", "*.png"), ("DDS Files", "*.dds")],
         initialfile=os.path.basename(file_name)
     )
     if not export_format:
@@ -751,11 +752,16 @@ def export_selected_file():
                     temp_file.write(data)
 
                 try:
-                    image = Image.open(temp_dds_path)
-                    image.save(export_format, "PNG")
-                    messagebox.showinfo("Success", f"Exported {file_name} as PNG to {export_format}")
+                    if export_format.lower().endswith(".png"):
+                        image = Image.open(temp_dds_path)
+                        image.save(export_format, "PNG")
+                        messagebox.showinfo("Success", f"Exported {file_name} as PNG to {export_format}")
+                    elif export_format.lower().endswith(".dds"):
+                        with open(export_format, 'wb') as out_f:
+                            out_f.write(data)
+                        messagebox.showinfo("Success", f"Exported {file_name} as DDS to {export_format}")
                 except Exception as e:
-                    messagebox.showerror("Error", f"Failed to convert DDS to PNG: {e}")
+                    messagebox.showerror("Error", f"Failed to export file: {e}")
                 finally:
                     if os.path.exists(temp_dds_path):
                         os.remove(temp_dds_path)
