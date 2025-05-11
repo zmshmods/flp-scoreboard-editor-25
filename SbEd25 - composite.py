@@ -70,7 +70,7 @@ initial_text_elements_config = [
     ("text_time_colon", ":", 113, 20, 22, "Time Text Color", False, "Colon Seperator of Time (---:--) X", -290, "Colon Seperator of Time (---:--) Y", -2), 
     ("text_time_sec1",  "5", 123, 23, 22, "Time Text Color", False, "4th Digit of Time (---:0-) X", -280, "4th Digit of Time (---:0-) Y", 2),
     ("text_time_sec2",  "6", 138, 23, 22, "Time Text Color", False, "5th Digit of Time (---:-0) X", -265, "5th Digit of Time (---:-0) Y", 2),
-    ("text_added_time", "+9", 6, -15, 22, None, False, "Added Time X", 130, "Added Time Y", 2),
+    ("text_added_time", "+9", 120, 67, 22, None, False, "Added Time X", 130, "Added Time Y", 83),
 ]
 
 predefined_image_coords: Dict[str, tuple[float, float, Optional[str], Optional[float], Optional[str], Optional[float]]] = { 
