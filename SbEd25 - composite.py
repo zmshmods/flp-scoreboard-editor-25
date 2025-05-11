@@ -28,11 +28,10 @@ offsets = {}
 colors = {}  
 current_image: Optional[Image.Image] = None
 
-previous_file_path: Optional[str] = None
-previous_offsets_values = {}
-previous_color_values = {}
-preview_bg_color_is_white = True
+original_loaded_offsets = {} 
+original_loaded_colors = {}  
 
+preview_bg_color_is_white = True
 current_image_index = 0
 image_files = [str(i) for i in range(1, 81)]
 
@@ -52,8 +51,8 @@ composite_drag_data = {
     "initial_game_offset_y_at_drag_start": 0.0 
 }
 composite_zoom_level = 1.0
-composite_pan_offset_x = 0.0
-composite_pan_offset_y = 0.0
+composite_pan_offset_x = 0.0 # Will be adjusted for initial view
+composite_pan_offset_y = 0.0 # Will be adjusted for initial view
 
 DEFAULT_TEXT_FONT_FAMILY = "Arial"
 DEFAULT_TEXT_BASE_FONT_SIZE = 14 
@@ -82,7 +81,65 @@ predefined_image_coords: Dict[str, tuple[float, float, Optional[str], Optional[f
 
 highlighted_offset_entries = [] 
 
+class EditAction: # (Same)
+    def __init__(self, string_var, old_value, new_value, key_tuple, entry_widget_ref, description="value change"):
+        self.string_var = string_var
+        self.old_value = old_value
+        self.new_value = new_value
+        self.key_tuple = key_tuple 
+        self.entry_widget_ref = entry_widget_ref 
+        self.description = description
+    def undo(self): self.string_var.set(self.old_value)
+    def redo(self): self.string_var.set(self.new_value)
+
+class UndoManager: # (Same)
+    def __init__(self, max_history=50):
+        self.undo_stack: List[EditAction] = []
+        self.redo_stack: List[EditAction] = []
+        self.max_history = max_history
+    def record_action(self, action: EditAction):
+        self.redo_stack.clear()
+        self.undo_stack.append(action)
+        if len(self.undo_stack) > self.max_history: self.undo_stack.pop(0)
+        self.update_menu_states()
+    def can_undo(self): return bool(self.undo_stack)
+    def can_redo(self): return bool(self.redo_stack)
+    def _apply_action_and_update_ui(self, action_to_apply: EditAction, is_undo: bool):
+        if is_undo: action_to_apply.undo()
+        else: action_to_apply.redo()
+        is_offset_var = False
+        if hasattr(root, 'offsets_vars'):
+            for key, var in root.offsets_vars.items():
+                if var == action_to_apply.string_var:
+                    update_value(key, action_to_apply.string_var, from_undo_redo=True)
+                    is_offset_var = True; break
+        if not is_offset_var and hasattr(root, 'color_vars'):
+            for key, var in root.color_vars.items():
+                if var == action_to_apply.string_var:
+                    update_color_preview_from_entry(key, action_to_apply.string_var, from_undo_redo=True)
+                    break
+        self.update_menu_states()
+    def undo(self):
+        if not self.can_undo(): return
+        action = self.undo_stack.pop()
+        self._apply_action_and_update_ui(action, is_undo=True)
+        self.redo_stack.append(action); self.update_menu_states()
+    def redo(self):
+        if not self.can_redo(): return
+        action = self.redo_stack.pop()
+        self._apply_action_and_update_ui(action, is_undo=False)
+        self.undo_stack.append(action); self.update_menu_states()
+    def clear_history(self):
+        self.undo_stack.clear(); self.redo_stack.clear(); self.update_menu_states()
+    def update_menu_states(self):
+        if hasattr(root, 'editmenu'):
+            root.editmenu.entryconfig("Undo", state=tk.NORMAL if self.can_undo() else tk.DISABLED)
+            root.editmenu.entryconfig("Redo", state=tk.NORMAL if self.can_redo() else tk.DISABLED)
+
+undo_manager = UndoManager()
+
 class Compression(Enum): NONE = "None"; EAHD = "EAHD"
+# ... (FileEntry, BinaryReader, Decompressor, Compressor, FifaBigFile - classes are the same as before) ...
 @dataclass
 class FileEntry:
     offset: int; size: int; name: str; file_type: str
@@ -187,12 +244,22 @@ def read_internal_name(fp: str) -> Optional[str]: # (Same)
             if n in text: return n
         return None
     except Exception as e: logging.error(f"Read internal name fail: {e}"); return None
-def open_file(): # (Same)
-    global file_path, current_image_index, composite_mode_active
+
+def open_file(): # MODIFIED: No "Loaded" status, file_path_label updated
+    global file_path, current_image_index, composite_mode_active, undo_manager
+    global original_loaded_offsets, original_loaded_colors
+
     fp_temp = filedialog.askopenfilename(filetypes=[("FIFA Big Files", "*.big")])
     if fp_temp:
         file_path = fp_temp; current_image_index = 0
-        update_status(f"Loaded: {os.path.basename(file_path)}", "blue"); add_internal_name()
+        undo_manager.clear_history() 
+        original_loaded_offsets.clear(); original_loaded_colors.clear()
+        if hasattr(root, 'asterisk_labels'):
+            for asterisk_label in root.asterisk_labels.values(): asterisk_label.config(text="")
+        
+        file_path_label.config(text=f"File: {file_path}") # Update persistent file path display
+        add_internal_name() 
+        
         is_internal_name_ok = internal_name_label.cget("text").startswith("Internal Name: ") and \
                               not internal_name_label.cget("text").endswith("(No Config)") and \
                               not internal_name_label.cget("text").endswith("(Detection Failed)")
@@ -206,6 +273,9 @@ def open_file(): # (Same)
             else:
                 preview_canvas.delete("all"); current_image = None
                 texture_label.config(text="Load .big / No internal name"); image_dimensions_label.config(text="")
+    else: 
+        if not file_path: file_path_label.config(text="File: None")
+
 def redraw_single_view_image(): # (Same)
     global current_image, preview_canvas, single_view_zoom_level, single_view_pan_offset_x, single_view_pan_offset_y
     if current_image is None: preview_canvas.delete("all"); return
@@ -273,10 +343,12 @@ def start_drag_handler(event): # (Same)
 def on_drag_handler(event): # (Same)
     if composite_mode_active: on_drag_composite(event) 
     else: on_drag_single(event)
-def on_drag_release_handler(event): # (Same)
-    global drag_data
+def on_drag_release_handler(event): # MODIFIED to clear highlights
+    global drag_data, composite_mode_active
     drag_data["is_panning"] = False 
     drag_data["is_panning_rmb"] = False 
+    if composite_mode_active:
+        clear_all_highlights()
 def start_drag_single(event): # (Same)
     global drag_data
     drag_data["is_panning"] = True; drag_data["x"] = event.x; drag_data["y"] = event.y
@@ -288,24 +360,28 @@ def on_drag_single(event): # (Same)
     drag_data["x"] = event.x; drag_data["y"] = event.y
     redraw_single_view_image()
 
-def load_current_values(): # (Same)
-    global file_path, previous_offsets_values, previous_color_values
+def load_current_values(): # MODIFIED
+    global file_path, original_loaded_offsets, original_loaded_colors
     if not file_path or not hasattr(root, 'offsets_vars') or not hasattr(root, 'color_vars'): return
+    original_loaded_offsets.clear(); original_loaded_colors.clear()
     try:
         with open(file_path, 'rb') as file:
             for off_tuple, var_obj in root.offsets_vars.items():
                 if not off_tuple: continue
                 try:
                     file.seek(off_tuple[0]); data = file.read(4); val = struct.unpack('<f', data)[0]
-                    var_obj.set(f"{val:.2f}"); previous_offsets_values[off_tuple] = var_obj.get()
+                    val_str = f"{val:.2f}"; var_obj.set(val_str)
+                    original_loaded_offsets[off_tuple] = val_str 
+                    if off_tuple in root.asterisk_labels: root.asterisk_labels[off_tuple].config(text="")
                 except Exception: var_obj.set("ERR") 
             for off_tuple, var_obj in root.color_vars.items():
                 if not off_tuple: continue
                 try:
                     file.seek(off_tuple[0]); data = file.read(4)
-                    hex_col = f'#{data[2]:02X}{data[1]:02X}{data[0]:02X}'
-                    var_obj.set(hex_col); previous_color_values[off_tuple] = hex_col
+                    hex_col = f'#{data[2]:02X}{data[1]:02X}{data[0]:02X}'; var_obj.set(hex_col)
+                    original_loaded_colors[off_tuple] = hex_col
                     if off_tuple in root.color_previews: root.color_previews[off_tuple].config(bg=hex_col)
+                    if off_tuple in root.asterisk_labels: root.asterisk_labels[off_tuple].config(text="")
                 except Exception: var_obj.set("#ERR")
     except Exception as e: messagebox.showerror("Error", f"Failed to read values: {e}")
 def add_internal_name(): # (Same)
@@ -344,56 +420,124 @@ def add_internal_name(): # (Same)
 def clear_editor_widgets(): # (Same)
     for frame in [positions_frame, sizes_frame, colors_frame]:
         for widget in frame.winfo_children(): widget.destroy()
-    for attr in ['offsets_vars','offsets_values','color_vars','color_values','color_previews', 'offset_entry_widgets']:
+    for attr in ['offsets_vars','offsets_values','color_vars','color_values','color_previews', 'offset_entry_widgets', 'asterisk_labels']:
         if hasattr(root, attr): getattr(root, attr).clear()
-def recreate_widgets(): # (Same, includes root.offset_entry_widgets)
+def recreate_widgets(): # (Same, includes root.offset_entry_widgets, root.asterisk_labels)
     clear_editor_widgets(); global offsets, colors
     root.offsets_vars = {tuple(v): tk.StringVar() for v in offsets.values()}
     root.color_vars = {tuple(v): tk.StringVar(value='#000000') for v in colors.values()}
     root.color_previews = {} 
     root.offset_entry_widgets = {} 
+    root.asterisk_labels = {}
+
+    def make_offset_update_lambda(key_tuple, var, entry_widget):
+        def on_offset_update(event=None): 
+            old_value = original_loaded_offsets.get(key_tuple, "") 
+            new_value = var.get()
+            # Record undo only if value changed and not from FocusOut after KeyRelease already recorded it
+            is_focus_out_after_key_release = (event and event.type == tk.EventType.FocusOut and 
+                                              hasattr(entry_widget, '_undo_recorded_for_this_change') and 
+                                              entry_widget._undo_recorded_for_this_change)
+            if old_value != new_value and not is_focus_out_after_key_release:
+                if not (event and event.type == tk.EventType.FocusOut): # Don't record for FocusOut if it's the same value as after KeyRelease
+                    action = EditAction(var, old_value, new_value, key_tuple, entry_widget, f"Offset change for {key_tuple}")
+                    undo_manager.record_action(action)
+                if event and event.type == tk.EventType.KeyRelease:
+                     entry_widget._undo_recorded_for_this_change = True 
+            update_value(key_tuple, var) 
+            if event and event.type == tk.EventType.FocusOut:
+                if hasattr(entry_widget, '_undo_recorded_for_this_change'):
+                    delattr(entry_widget, '_undo_recorded_for_this_change')
+        return on_offset_update
+    
+    def make_increment_lambda(key_tuple, var, entry_widget, direction):
+        def on_increment(event=None):
+            old_value = var.get()
+            entry_widget.unbind("<KeyRelease>") # Avoid double recording
+            increment_value(event, var, direction) 
+            new_value = var.get()
+            if old_value != new_value:
+                action = EditAction(var, old_value, new_value, key_tuple, entry_widget, f"Increment {direction}")
+                undo_manager.record_action(action)
+            update_value(key_tuple, var) 
+            entry_widget.bind("<KeyRelease>", make_offset_update_lambda(key_tuple, var, entry_widget))
+        return on_increment
+
     row_p = 0
     for lbl, off_list in offsets.items():
         key_tuple = tuple(off_list)
         if "Size" not in lbl and not lbl.startswith("Image_"):
-            col = 0 if "X" in lbl or "Width" in lbl else 4
-            tk.Label(positions_frame,text=lbl).grid(row=row_p,column=col,padx=10,pady=5,sticky="w")
+            col = 0 if "X" in lbl or "Width" in lbl else 4; base_col = col
+            tk.Label(positions_frame,text=lbl).grid(row=row_p,column=base_col,padx=5,pady=5,sticky="w")
             entry = tk.Entry(positions_frame,textvariable=root.offsets_vars[key_tuple],width=10)
-            entry.grid(row=row_p,column=col+1,padx=10,pady=5)
-            entry.bind("<KeyRelease>",lambda e,kt=key_tuple,v=root.offsets_vars[key_tuple]:update_value(kt,v))
-            entry.bind('<KeyPress-Up>',lambda e,v=root.offsets_vars[key_tuple]:increment_value(e,v))
-            entry.bind('<KeyPress-Down>',lambda e,v=root.offsets_vars[key_tuple]:increment_value(e,v))
-            root.offset_entry_widgets[key_tuple] = entry
+            entry.grid(row=row_p,column=base_col+1,padx=0,pady=5)
+            update_lambda = make_offset_update_lambda(key_tuple, root.offsets_vars[key_tuple], entry)
+            entry.bind("<KeyRelease>", update_lambda); entry.bind("<FocusOut>", update_lambda) 
+            entry.bind('<KeyPress-Up>', make_increment_lambda(key_tuple, root.offsets_vars[key_tuple], entry, "Up"))
+            entry.bind('<KeyPress-Down>', make_increment_lambda(key_tuple, root.offsets_vars[key_tuple], entry, "Down"))
+            asterisk_lbl = tk.Label(positions_frame, text="", fg="red", width=1); asterisk_lbl.grid(row=row_p, column=base_col+2, padx=(0,5), pady=5, sticky="w")
+            root.asterisk_labels[key_tuple] = asterisk_lbl; root.offset_entry_widgets[key_tuple] = entry
             if col==4 or "Y" in lbl or "Height" in lbl: row_p+=1
     row_s=0 
     for lbl,off_list in offsets.items():
         key_tuple = tuple(off_list)
         if "Size" in lbl:
-            tk.Label(sizes_frame,text=lbl).grid(row=row_s,column=0,padx=10,pady=5,sticky="w")
+            tk.Label(sizes_frame,text=lbl).grid(row=row_s,column=0,padx=5,pady=5,sticky="w")
             entry=tk.Entry(sizes_frame,textvariable=root.offsets_vars[key_tuple],width=10)
-            entry.grid(row=row_s,column=1,padx=10,pady=5) 
-            entry.bind("<KeyRelease>",lambda e,kt=key_tuple,v=root.offsets_vars[key_tuple]:update_value(kt,v))
-            entry.bind('<KeyPress-Up>',lambda e,v=root.offsets_vars[key_tuple]:increment_value(e,v))
-            entry.bind('<KeyPress-Down>',lambda e,v=root.offsets_vars[key_tuple]:increment_value(e,v))
+            entry.grid(row=row_s,column=1,padx=0,pady=5) 
+            update_lambda_size = make_offset_update_lambda(key_tuple, root.offsets_vars[key_tuple], entry)
+            entry.bind("<KeyRelease>", update_lambda_size); entry.bind("<FocusOut>", update_lambda_size)
+            entry.bind('<KeyPress-Up>', make_increment_lambda(key_tuple, root.offsets_vars[key_tuple], entry, "Up"))
+            entry.bind('<KeyPress-Down>', make_increment_lambda(key_tuple, root.offsets_vars[key_tuple], entry, "Down"))
+            asterisk_lbl_size = tk.Label(sizes_frame, text="", fg="red", width=1); asterisk_lbl_size.grid(row=row_s, column=2, padx=(0,5), pady=5, sticky="w")
+            root.asterisk_labels[key_tuple] = asterisk_lbl_size; root.offset_entry_widgets[key_tuple] = entry
             row_s+=1
     row_c=0 
     for lbl,off_list in colors.items():
         key_tuple = tuple(off_list)
-        tk.Label(colors_frame,text=lbl).grid(row=row_c,column=0,padx=10,pady=5,sticky="w")
+        tk.Label(colors_frame,text=lbl).grid(row=row_c,column=0,padx=5,pady=5,sticky="w")
         entry=tk.Entry(colors_frame,textvariable=root.color_vars[key_tuple],width=10)
-        entry.grid(row=row_c,column=1,padx=10,pady=5) 
+        entry.grid(row=row_c,column=1,padx=0,pady=5) 
+        def make_color_update_lambda(k_t, var, entry_w):
+            def on_color_update(event=None):
+                old_val = original_loaded_colors.get(k_t, "")
+                new_val = var.get()
+                is_focus_out_after_key = (event and event.type == tk.EventType.FocusOut and hasattr(entry_w, '_undo_recorded_for_this_change') and entry_w._undo_recorded_for_this_change)
+                if old_val != new_val and not is_focus_out_after_key:
+                    if not (event and event.type == tk.EventType.FocusOut):
+                        action = EditAction(var, old_val, new_val, k_t, entry_w, f"Color change for {k_t}")
+                        undo_manager.record_action(action)
+                    if event and event.type == tk.EventType.KeyRelease: entry_w._undo_recorded_for_this_change = True
+                update_color_preview_from_entry(k_t, var)
+                if event and event.type == tk.EventType.FocusOut:
+                    if hasattr(entry_w, '_undo_recorded_for_this_change'): delattr(entry_w, '_undo_recorded_for_this_change')
+            return on_color_update
+        color_update_lambda = make_color_update_lambda(key_tuple, root.color_vars[key_tuple], entry)
         entry.bind('<KeyPress>',lambda e,v=root.color_vars[key_tuple]:restrict_color_entry(e,v))
-        entry.bind('<KeyRelease>',lambda e,kt=key_tuple,v=root.color_vars[key_tuple]:update_color_preview_from_entry(kt,v))
+        entry.bind('<KeyRelease>', color_update_lambda); entry.bind("<FocusOut>", color_update_lambda)
         preview_lbl=tk.Label(colors_frame,bg=root.color_vars[key_tuple].get(),width=3,height=1,relief="sunken")
-        preview_lbl.grid(row=row_c,column=2,padx=10,pady=5)
-        preview_lbl.bind("<Button-1>",lambda e,kt=key_tuple,v=root.color_vars[key_tuple]:choose_color(kt,v))
+        preview_lbl.grid(row=row_c,column=2,padx=5,pady=5)
+        def make_choose_color_lambda(k_t, var_obj, preview_widget, entry_ref):
+            def on_choose_color(event=None):
+                old_color = var_obj.get()
+                choose_color(k_t, var_obj, preview_widget) 
+                new_color = var_obj.get()
+                if old_color != new_color:
+                    action = EditAction(var_obj, old_color, new_color, k_t, entry_ref, f"Choose color for {k_t}")
+                    undo_manager.record_action(action)
+                update_color_preview_from_entry(k_t, var_obj) 
+            return on_choose_color
+        preview_lbl.bind("<Button-1>", make_choose_color_lambda(key_tuple, root.color_vars[key_tuple], preview_lbl, entry))
         root.color_previews[key_tuple]=preview_lbl
+        asterisk_lbl_color = tk.Label(colors_frame, text="", fg="red", width=1); asterisk_lbl_color.grid(row=row_c, column=3, padx=(0,5), pady=5, sticky="w")
+        root.asterisk_labels[key_tuple] = asterisk_lbl_color
         row_c+=1
+
 def format_filesize(b: int) -> str: # (Same)
     if b<1024: return f"{b} bytes";
     return f"{b/1024:.2f} KB" if b<1024*1024 else f"{b/(1024*1024):.2f} MB"
-def save_file(): # (Same)
-    global file_path
+def save_file(): # MODIFIED to update original_loaded values and clear asterisks
+    global file_path, original_loaded_offsets, original_loaded_colors
     if not file_path: messagebox.showerror("Error", "No file."); return
     if not hasattr(root, 'offsets_vars') or not hasattr(root, 'color_vars'): messagebox.showerror("Error", "Data not init."); return
     try:
@@ -403,26 +547,41 @@ def save_file(): # (Same)
                 try: val_f = float(val_str); packed = struct.pack('<f', val_f)
                 except ValueError: messagebox.showerror("Save Err",f"Bad float '{val_str}' for {off_key}"); return
                 for addr in off_key: f.seek(addr); f.write(packed)
+                original_loaded_offsets[off_key] = val_str 
+                if off_key in root.asterisk_labels: root.asterisk_labels[off_key].config(text="")
             for off_key, var_obj in root.color_vars.items():
                 hex_str = var_obj.get()
                 if not (len(hex_str)==7 and hex_str.startswith('#')): messagebox.showerror("Save Err",f"Bad color '{hex_str}' for {off_key}"); return
                 try: r,g,b = int(hex_str[1:3],16),int(hex_str[3:5],16),int(hex_str[5:7],16); bgra = bytes([b,g,r,0xFF])
                 except ValueError: messagebox.showerror("Save Err",f"Bad hex '{hex_str}' for {off_key}"); return
                 for addr in off_key: f.seek(addr); f.write(bgra)
-        update_status("File saved.", "green")
+                original_loaded_colors[off_key] = hex_str 
+                if off_key in root.asterisk_labels: root.asterisk_labels[off_key].config(text="")
+        update_status("File saved successfully.", "green")
+        undo_manager.clear_history() 
     except Exception as e: messagebox.showerror("Save Err",f"Open/Save fail: {e}")
 
-def update_value(offset_key_tuple, string_var): # MODIFIED for better visual update from GUI entries
+def update_value(offset_key_tuple, string_var, from_undo_redo=False): # MODIFIED to update asterisk
     global composite_mode_active, composite_elements, offsets, initial_text_elements_config, predefined_image_coords
+    global original_loaded_offsets 
     val_str = string_var.get()
-    logging.debug(f"update_value for offset key {offset_key_tuple} with value '{val_str}' from Entry/Increment")
-    try:
-        new_game_offset_val = float(val_str)
+    if not from_undo_redo: logging.debug(f"update_value for {offset_key_tuple} with '{val_str}'")
+    try: new_game_offset_val = float(val_str)
     except ValueError: 
-        update_status(f"Invalid float value '{val_str}' entered", "red"); return
-    update_status(f"Game offset for {offset_key_tuple} is now {new_game_offset_val:.2f} (in Entry)", "blue")
+        if not from_undo_redo: update_status(f"Invalid float '{val_str}'", "red")
+        if offset_key_tuple in root.asterisk_labels: root.asterisk_labels[offset_key_tuple].config(text="!")
+        return
+    if offset_key_tuple in root.asterisk_labels:
+        original_val = original_loaded_offsets.get(offset_key_tuple)
+        is_changed = True
+        if original_val is not None:
+            try:
+                if abs(float(original_val) - new_game_offset_val) < 0.0001: is_changed = False
+            except ValueError: pass 
+        root.asterisk_labels[offset_key_tuple].config(text="*" if is_changed else "")
+    if not from_undo_redo: update_status(f"Game offset for {offset_key_tuple} now {new_game_offset_val:.2f}", "blue")
 
-    if composite_mode_active:
+    if composite_mode_active: # Logic to update composite view if this offset is linked
         visual_updated_for_element = None 
         for el_data in composite_elements:
             is_x_offset, is_y_offset = False, False
@@ -432,7 +591,7 @@ def update_value(offset_key_tuple, string_var): # MODIFIED for better visual upd
             if y_label and y_label in offsets and tuple(offsets[y_label]) == offset_key_tuple: is_y_offset = True
 
             if is_x_offset or is_y_offset:
-                gui_ref_x, gui_ref_y = el_data.get('gui_ref_x'), el_data.get('gui_ref_y') # Get stored GUI refs
+                gui_ref_x, gui_ref_y = el_data.get('gui_ref_x'), el_data.get('gui_ref_y')
                 base_game_x, base_game_y = el_data.get('base_game_x'), el_data.get('base_game_y')
 
                 if gui_ref_x is not None and gui_ref_y is not None: 
@@ -446,7 +605,7 @@ def update_value(offset_key_tuple, string_var): # MODIFIED for better visual upd
                 if visual_updated_for_element:
                     logging.info(f"Comp: Visual for {el_data.get('display_tag')} updated from Entry to ({el_data['original_x']:.1f}, {el_data['original_y']:.1f})")
                     leader_tag = visual_updated_for_element.get('display_tag')
-                    if leader_tag:
+                    if leader_tag: # If this element is a leader, update its followers
                         for follower_elem in composite_elements:
                             if follower_elem.get('conjoined_to_tag') == leader_tag:
                                 follower_elem['original_x'] = visual_updated_for_element['original_x'] + follower_elem.get('relative_offset_x', 0)
@@ -454,41 +613,61 @@ def update_value(offset_key_tuple, string_var): # MODIFIED for better visual upd
                     break 
         if visual_updated_for_element: redraw_composite_view()
 
-def increment_value(event, str_var): # (Same)
+def increment_value(event, str_var, direction): # (No change from previous, calls update_value)
     try:
-        val_str=str_var.get(); val_f=float(val_str if val_str and val_str!="ERR" else "0.0")
-        inc=0.1 if event.state&1 else (0.01 if event.state&4 else 1.0)
-        val_f += inc if event.keysym=='Up' else -inc
-        str_var.set(f"{val_f:.4f}")
-        if hasattr(root,'offsets_vars'):
-            for k,v_lookup in root.offsets_vars.items():
-                if v_lookup==str_var: update_value(k,str_var); break
-    except ValueError: update_status("Bad inc value","red")
-def update_color_preview_from_entry(off_key, str_var): # (Same - already redraws composite)
+        current_val_str = str_var.get()
+        if not current_val_str or current_val_str == "ERR": current_val_str = "0.0"
+        value_float = float(current_val_str)
+        increment_amt = 0.1 if event.state & 0x0001 else 1.0 
+        if event.state & 0x0004: increment_amt = 0.01
+        if direction == 'Up': value_float += increment_amt
+        elif direction == 'Down': value_float -= increment_amt
+        str_var.set(f"{value_float:.4f}") 
+    except ValueError:
+        update_status("Invalid value for increment", "red")
+
+def update_color_preview_from_entry(off_key, str_var, from_undo_redo=False): # Added from_undo_redo, updates asterisk
+    global original_loaded_colors
     hex_str = str_var.get()
+    valid_hex = False
     if len(hex_str)==7 and hex_str.startswith('#'):
         try:
-            int(hex_str[1:],16)
-            if hasattr(root,'color_previews') and off_key in root.color_previews: root.color_previews[off_key].config(bg=hex_str)
-            update_status("Color preview updated","blue")
+            int(hex_str[1:],16); valid_hex = True
+            if hasattr(root,'color_previews') and off_key in root.color_previews: 
+                root.color_previews[off_key].config(bg=hex_str)
+            if not from_undo_redo: update_status("Color preview updated","blue")
             if composite_mode_active: redraw_composite_view() 
-        except ValueError: update_status("Bad hex color","red")
-    elif len(hex_str)>0 and not hex_str.startswith('#') and all(c in "0123456789abcdefABCDEF" for c in hex_str) and len(hex_str)<=6:
-        str_var.set("#"+hex_str); update_color_preview_from_entry(off_key,str_var)
-def choose_color(off_key, str_var): # (Same - already redraws composite)
-    curr_hex = str_var.get();
+        except ValueError: 
+            if not from_undo_redo: update_status("Bad hex color","red")
+    elif not from_undo_redo and len(hex_str)>0 and not hex_str.startswith('#') and \
+         all(c in "0123456789abcdefABCDEF" for c in hex_str) and len(hex_str)<=6:
+        str_var.set("#"+hex_str); update_color_preview_from_entry(off_key,str_var, from_undo_redo) 
+    if off_key in root.asterisk_labels:
+        original_color = original_loaded_colors.get(off_key)
+        is_changed = (original_color != hex_str) if valid_hex else True
+        root.asterisk_labels[off_key].config(text="*" if is_changed else "")
+
+def choose_color(off_key, str_var, preview_widget): # (Same - already handles undo and calls update_color_preview_from_entry)
+    old_color = str_var.get()
+    curr_hex = old_color
     if not (curr_hex.startswith("#") and len(curr_hex)==7): curr_hex="#000000"
     new_color_tuple = colorchooser.askcolor(initialcolor=curr_hex)
     if new_color_tuple and new_color_tuple[1]:
-        chosen_hex = new_color_tuple[1]; str_var.set(chosen_hex)
-        if hasattr(root,'color_previews') and off_key in root.color_previews: root.color_previews[off_key].config(bg=chosen_hex)
-        update_status("Color chosen","green")
-        if composite_mode_active: redraw_composite_view() 
+        chosen_hex = new_color_tuple[1]
+        entry_widget_for_color = None # Find associated entry if needed for EditAction
+        if hasattr(root, 'offset_entry_widgets'): # Check if this key is for an offset entry (unlikely for color)
+             entry_widget_for_color = root.offset_entry_widgets.get(off_key) 
+        if old_color != chosen_hex:
+            action = EditAction(str_var, old_color, chosen_hex, off_key, entry_widget_for_color, f"Choose color for {off_key}")
+            undo_manager.record_action(action)
+        str_var.set(chosen_hex) 
+        preview_widget.config(bg=chosen_hex) 
+        update_color_preview_from_entry(off_key, str_var) 
 def update_status(msg, fg_col): status_label.config(text=msg, fg=fg_col) # (Same)
 def about(): # (Same)
     win=tk.Toplevel(root);win.title("About");win.geometry("450x300");win.resizable(False,False) 
     tk.Label(win,text="FLP Scoreboard Editor 25 By FIFA Legacy Project.",pady=10,font=("Helvetica",12,"bold")).pack()
-    tk.Label(win,text="Version 1.12 [Build 10 May 2025]",pady=10).pack() 
+    tk.Label(win,text="Version 1.13 [Build 10 May 2025]",pady=10).pack() 
     tk.Label(win,text="© 2025 FIFA Legacy Project. All Rights Reserved.",pady=10).pack()
     tk.Label(win,text="Designed & Developed By Emran_Ahm3d.",pady=10).pack()
     tk.Label(win,text="Special Thanks to Riesscar, KO, MCK and Marconis for the Research.",pady=10, wraplength=400).pack() 
@@ -531,7 +710,7 @@ def toggle_preview_background(): # (Same)
     if file_path and current_image : redraw_single_view_image()
 
 # --- Composite Mode Functions ---
-def toggle_composite_mode(): # (Same - handles auto-switch, clearing, button states)
+def toggle_composite_mode(): # MODIFIED: No "Switched to 10.dds" status message. Initial pan.
     global composite_mode_active, current_image_index, image_files, current_image
     global composite_zoom_level, composite_pan_offset_x, composite_pan_offset_y
     global import_button, export_button, highlighted_offset_entries
@@ -554,14 +733,19 @@ def toggle_composite_mode(): # (Same - handles auto-switch, clearing, button sta
                 if not extract_and_display_texture(): 
                     messagebox.showerror("Error", "Could not display 10.dds. Cannot enter composite mode.")
                     logging.error("Failed to display 10.dds for composite mode entry."); return
-                update_status("Switched to 10.dds for composite mode", "blue"); root.update_idletasks()
+                # update_status("Switched to 10.dds for composite mode", "blue") # Removed status
+                root.update_idletasks()
             except ValueError: messagebox.showerror("Error","'10' not found in image_files. Cannot enter composite."); return
         
         preview_canvas.delete("all"); current_image = None 
         texture_label.config(text=""); image_dimensions_label.config(text="")
         
         composite_mode_active = True
-        composite_zoom_level = 1.0; composite_pan_offset_x = 0.0; composite_pan_offset_y = 0.0
+        composite_zoom_level = 1.0
+        # Initial pan to show more down-right. Adjust these values as needed.
+        # Negative X pans left (shows right), Negative Y pans up (shows bottom)
+        composite_pan_offset_x = 250.0 
+        composite_pan_offset_y = 50.0  
         display_composite_view() 
         
         if not composite_mode_active: logging.warning("display_composite_view failed."); return 
@@ -643,7 +827,7 @@ def redraw_composite_view(): # (Same - handles dynamic text color)
             except Exception as e_redraw_img: logging.error(f"Redraw img {el_data.get('display_tag')}: {e_redraw_img}")
         else: logging.warning(f"Unknown element type: {el_data.get('type')}")
 
-def display_composite_view(): # MODIFIED: Initial visual positions are GUI_ref + (current_game_offset - base_game_offset)
+def display_composite_view(): # MODIFIED: Initial visual positions from GUI_Ref + Deviation.
     global composite_elements, preview_canvas, file_path, composite_mode_active
     global initial_text_elements_config, predefined_image_coords, offsets, root 
     
@@ -697,7 +881,7 @@ def display_composite_view(): # MODIFIED: Initial visual positions are GUI_ref +
                             except ValueError: img_x_var_linked=None; img_y_var_linked=None 
                 
                 is_fixed_image = (display_suffix == "10") 
-                if display_suffix == "14": is_fixed_image = True 
+                # img_14 will be marked fixed during conjoining setup
 
                 element_data = {'type':"image",'pil_image':pil_img,
                                 'original_x':current_original_x,'original_y':current_original_y,
@@ -753,20 +937,26 @@ def display_composite_view(): # MODIFIED: Initial visual positions are GUI_ref +
         if leader_tag_for_img14 in temp_composite_elements_dict and follower_tag_img14 in temp_composite_elements_dict:
             leader_el = temp_composite_elements_dict[leader_tag_for_img14]
             follower_el = temp_composite_elements_dict[follower_tag_img14]
+            
+            img14_gui_ref_x = predefined_image_coords[follower_tag_img14][0]
+            img14_gui_ref_y = predefined_image_coords[follower_tag_img14][1]
+            
+            text_added_time_cfg = next(item for item in initial_text_elements_config if item[0] == leader_tag_for_img14)
+            text_added_time_gui_ref_x = text_added_time_cfg[2]
+            text_added_time_gui_ref_y = text_added_time_cfg[3]
+
+            design_relative_offset_x = img14_gui_ref_x - text_added_time_gui_ref_x
+            design_relative_offset_y = img14_gui_ref_y - text_added_time_gui_ref_y
+
+            follower_el['original_x'] = leader_el['original_x'] + design_relative_offset_x
+            follower_el['original_y'] = leader_el['original_y'] + design_relative_offset_y
+            
             follower_el['conjoined_to_tag'] = leader_tag_for_img14
-            # Relative offset is based on their initial GUI reference points, not the current deviated original_x/y
-            leader_gui_ref_x = leader_el['gui_ref_x']
-            leader_gui_ref_y = leader_el['gui_ref_y']
-            follower_gui_ref_x = follower_el['gui_ref_x']
-            follower_gui_ref_y = follower_el['gui_ref_y']
-
-            follower_el['relative_offset_x'] = follower_gui_ref_x - leader_gui_ref_x
-            follower_el['relative_offset_y'] = follower_gui_ref_y - leader_gui_ref_y
+            follower_el['relative_offset_x'] = design_relative_offset_x 
+            follower_el['relative_offset_y'] = design_relative_offset_y
             follower_el['is_fixed'] = True 
-
-            # Now correctly set the follower's initial original_x/y based on leader's current (possibly deviated) original_x/y
-            follower_el['original_x'] = leader_el['original_x'] + follower_el['relative_offset_x']
-            follower_el['original_y'] = leader_el['original_y'] + follower_el['relative_offset_y']
+            if not any(item[0] == leader_tag_for_img14 and item[6] for item in initial_text_elements_config):
+                 leader_el['is_fixed'] = False # Ensure leader is draggable if not explicitly fixed in its own config
         
         composite_elements = list(temp_composite_elements_dict.values())
         redraw_composite_view()
@@ -805,10 +995,10 @@ def on_pan_composite(event): # (Same)
     redraw_composite_view()
 
 def start_drag_composite(event): # (Same - already stores initial game offsets)
-    global composite_drag_data, composite_elements, drag_data
+    global composite_drag_data, composite_elements, drag_data, highlighted_offset_entries, offsets, root
+    clear_all_highlights()
     if event.num == 3: start_pan_composite(event); return
     drag_data["is_panning"] = False; drag_data["is_panning_rmb"] = False
-    clear_all_highlights() 
     item_tuple = event.widget.find_closest(event.x,event.y)
     if not item_tuple: composite_drag_data['item']=None; return
     item_id = item_tuple[0]
@@ -830,7 +1020,6 @@ def start_drag_composite(event): # (Same - already stores initial game offsets)
                                         'initial_game_offset_x_at_drag_start': initial_game_x, 
                                         'initial_game_offset_y_at_drag_start': initial_game_y })
             preview_canvas.tag_raise(item_id)
-            logging.info(f"Dragging item {item_id} ({el_data.get('display_tag','N/A')})")
             x_label = el_data.get('x_offset_label_linked'); y_label = el_data.get('y_offset_label_linked')
             if x_label and x_label in offsets and hasattr(root, 'offset_entry_widgets'):
                 x_key = tuple(offsets[x_label])
@@ -868,13 +1057,22 @@ def on_drag_composite(event): # (Same - already handles relative game offset upd
         initial_game_y = composite_drag_data['initial_game_offset_y_at_drag_start']
         new_game_offset_x = initial_game_x + delta_visual_original_x 
         new_game_offset_y = initial_game_y + delta_visual_original_y
-        x_var_linked.set(f"{new_game_offset_x:.2f}")
-        y_var_linked.set(f"{new_game_offset_y:.2f}")
+        old_x_str = x_var_linked.get(); old_y_str = y_var_linked.get() 
+        x_var_linked.set(f"{new_game_offset_x:.2f}"); y_var_linked.set(f"{new_game_offset_y:.2f}")
         logging.info(f"  -> For '{dragged_elem_data.get('display_tag')}': Linked Game Offsets set to X={new_game_offset_x:.2f}, Y={new_game_offset_y:.2f} (relative to start)")
-        x_offset_label = dragged_elem_data.get('x_offset_label_linked')
-        y_offset_label = dragged_elem_data.get('y_offset_label_linked')
-        if x_offset_label and x_offset_label in offsets: update_value(tuple(offsets[x_offset_label]), x_var_linked)
-        if y_offset_label and y_offset_label in offsets: update_value(tuple(offsets[y_offset_label]), y_var_linked)
+        x_offset_label = dragged_elem_data.get('x_offset_label_linked'); y_offset_label = dragged_elem_data.get('y_offset_label_linked')
+        if x_offset_label and x_offset_label in offsets:
+            x_key_tuple = tuple(offsets[x_offset_label])
+            if old_x_str != x_var_linked.get(): 
+                action_x = EditAction(x_var_linked, old_x_str, x_var_linked.get(), x_key_tuple, root.offset_entry_widgets.get(x_key_tuple), f"Drag {dragged_elem_data.get('display_tag')} X")
+                undo_manager.record_action(action_x)
+            update_value(x_key_tuple, x_var_linked, from_undo_redo=True) 
+        if y_offset_label and y_offset_label in offsets:
+            y_key_tuple = tuple(offsets[y_offset_label])
+            if old_y_str != y_var_linked.get():
+                action_y = EditAction(y_var_linked, old_y_str, y_var_linked.get(), y_key_tuple, root.offset_entry_widgets.get(y_key_tuple), f"Drag {dragged_elem_data.get('display_tag')} Y")
+                undo_manager.record_action(action_y)
+            update_value(y_key_tuple, y_var_linked, from_undo_redo=True) 
     if dragged_elem_data.get('type') == "text": logging.info(f"Text '{dragged_elem_data.get('display_tag')}' {log_message_suffix}")
     elif dragged_elem_data.get('type') == "image": logging.info(f"Image '{dragged_elem_data.get('display_tag')}' {log_message_suffix}")
     dragged_tag = dragged_elem_data.get('display_tag')
@@ -891,10 +1089,11 @@ def on_drag_release_composite(event): # Same
 
 # --- UI Setup --- (Same)
 root = tk.Tk()
-root.title("FLP Scoreboard Editor 25 (v1.12)") 
+root.title("FLP Scoreboard Editor 25 (v1.13)") 
 root.geometry("930x710"); root.resizable(False, False)
 menubar = tk.Menu(root); filemenu = tk.Menu(menubar, tearoff=0); filemenu.add_command(label="Open", command=open_file, accelerator="Ctrl+O"); filemenu.add_command(label="Save", command=save_file, accelerator="Ctrl+S"); filemenu.add_separator(); filemenu.add_command(label="Exit", command=exit_app); menubar.add_cascade(label="File", menu=filemenu)
-root.bind_all("<Control-o>", lambda event: open_file()); root.bind_all("<Control-s>", lambda event: save_file())
+editmenu = tk.Menu(menubar, tearoff=0); editmenu.add_command(label="Undo", command=lambda: undo_manager.undo(), accelerator="Ctrl+Z", state=tk.DISABLED); editmenu.add_command(label="Redo", command=lambda: undo_manager.redo(), accelerator="Ctrl+Y", state=tk.DISABLED); menubar.add_cascade(label="Edit", menu=editmenu); root.editmenu = editmenu
+root.bind_all("<Control-z>", lambda event: undo_manager.undo()); root.bind_all("<Control-y>", lambda event: undo_manager.redo())
 helpmenu = tk.Menu(menubar, tearoff=0); helpmenu.add_command(label="About", command=about); helpmenu.add_separator(); helpmenu.add_command(label="Documentation", command=show_documentation); menubar.add_cascade(label="Help", menu=helpmenu); root.config(menu=menubar)
 notebook = ttk.Notebook(root); positions_frame=ttk.Frame(notebook); sizes_frame=ttk.Frame(notebook); colors_frame=ttk.Frame(notebook)
 notebook.add(positions_frame,text="Positions"); notebook.add(sizes_frame,text="Sizes"); notebook.add(colors_frame,text="Colors"); notebook.pack(expand=1,fill="both",padx=10,pady=5)
@@ -910,13 +1109,14 @@ composite_view_button=ttk.Button(vertical_buttons_frame,text="Composite View",co
 texture_info_frame=tk.Frame(root); texture_info_frame.pack(fill=tk.X,padx=10,pady=(0,5))
 texture_label=tk.Label(texture_info_frame,text="No texture loaded",font=('Helvetica',9),anchor='w'); texture_label.pack(side=tk.LEFT,padx=5)
 image_dimensions_label=tk.Label(texture_info_frame,text=" ",font=('Helvetica',10),anchor='e'); image_dimensions_label.pack(side=tk.RIGHT,padx=10)
-buttons_frame=tk.Frame(root); buttons_frame.place(relx=1.0,rely=1.0,anchor='se',x=-10,y=-85)
+buttons_frame=tk.Frame(root); buttons_frame.place(relx=1.0,rely=1.0,anchor='se',x=-10,y=-85) 
+bottom_frame = tk.Frame(root); bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0,5))
+status_label = tk.Label(bottom_frame, text="Ready", anchor=tk.W, fg="blue", font=('Helvetica', 10)); status_label.pack(side=tk.LEFT, padx=0)
+file_path_label = tk.Label(bottom_frame, text="File: None", anchor=tk.W, font=('Helvetica', 9)); file_path_label.pack(side=tk.LEFT, padx=10) 
+internal_name_label = tk.Label(bottom_frame, text="Internal Name: Not Loaded", anchor=tk.E, font=('Helvetica', 10)); internal_name_label.pack(side=tk.RIGHT, padx=0)
 import_button=ttk.Button(buttons_frame,text="IMPORT",command=import_texture,width=10); import_button.pack(pady=2)
 export_button=ttk.Button(buttons_frame,text="EXPORT",command=export_selected_file,width=10); export_button.pack(pady=2)
 save_button_main=ttk.Button(buttons_frame,text="SAVE",command=save_file,width=10); save_button_main.pack(pady=(2,0))
-bottom_frame=tk.Frame(root); bottom_frame.pack(side=tk.BOTTOM,fill=tk.X,padx=10,pady=(0,5))
-status_label=tk.Label(bottom_frame,text="Ready",anchor=tk.W,fg="blue",font=('Helvetica',10)); status_label.pack(side=tk.LEFT,padx=0)
-internal_name_label=tk.Label(bottom_frame,text="Internal Name: Not Loaded",anchor=tk.E,font=('Helvetica',10)); internal_name_label.pack(side=tk.RIGHT,padx=0)
 root.style=ttk.Style(); root.style.configure('TButton',font=('Helvetica',10),padding=3); root.style.configure('Large.TButton',font=('Helvetica',12),padding=5)
 left_arrow_button.configure(style='TButton'); right_arrow_button.configure(style='TButton'); toggle_bg_button.configure(style='TButton'); composite_view_button.configure(style='TButton')
 import_button.configure(style='Large.TButton'); export_button.configure(style='Large.TButton'); save_button_main.configure(style='Large.TButton')
@@ -926,4 +1126,5 @@ def on_map_event(event): # Same
 
 root.bind("<Map>", on_map_event, "+")
 clear_editor_widgets()
+undo_manager.update_menu_states() 
 root.mainloop()
