@@ -1,5 +1,7 @@
 {
   "2002": {
+    "reference_width": "586",
+    "reference_height": "156",
     "offsets": {
       "Home Team Name X": "0x470C",
       "Home Team Name Y": "0x4710",
@@ -39,8 +41,7 @@
       "Home Team Name Color": "0xB00",
       "Away Team Name Color": "0xB60",
       "Home Score Color": "0xBF8",
-      "Away Score Color": "0xCB8",
-      "Score Seperator Color": "0xC58",
+      "Away Score Color": "0xC58",
       "Time Text Color": ["0xD18", "0xD78", "0xDD8", "0xE38", "0xE98", "0xEF8"]
     }
   }
