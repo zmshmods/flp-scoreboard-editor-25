@@ -60,7 +60,7 @@ colors = {}
 current_image: Optional[Image.Image] = None
 
 original_loaded_offsets = {}
-original_loaded_colors = {}
+original_loaded_colors = {} # Will store hex for regular, "WHITE"/"BLACK" for special
 
 preview_bg_color_is_white = True
 current_image_index = 0
@@ -90,11 +90,11 @@ DEFAULT_TEXT_FONT_FAMILY = "Arial"
 DEFAULT_TEXT_BASE_FONT_SIZE = 14
 DEFAULT_TEXT_COLOR_FALLBACK = "white"
 
-# New structure: (tag, text, gui_x, gui_y, design_font_size, font_size_offset_label, color_label, is_fixed, x_offset_label, base_game_x, y_offset_label, base_game_y)
+# (tag, text, gui_x, gui_y, design_font_size, font_size_offset_label, color_label_or_special_key, is_fixed, x_offset_label, base_game_x, y_offset_label, base_game_y)
 initial_text_elements_config = [
-    ("text_hom", "HOM", 185, 22, 24, "Home Team Name Size", "Home Team Name Color", # design_font_size is GUI-scaled
+    ("text_hom", "HOM", 188, 22, 24, "Home Team Name Size", "Home Team Name Color",
      False, "Home Team Name X", 241, "Home Team Name Y", 17),
-    ("text_awa", "AWA", 375, 22, 24, "Away Team Name Size", "Away Team Name Color",
+    ("text_awa", "AWA", 370, 22, 24, "Away Team Name Size", "Away Team Name Color",
      False, "Away Team Name X", 425, "Away Team Name Y", 17),
     ("text_score1", "1", 280, 22, 24, "Home Score Size", "Home Score Color",
      False, "Home Score X", 352, "Home Score Y", 17),
@@ -112,15 +112,17 @@ initial_text_elements_config = [
      False, "4th Digit of Time (---:0-) X", -280, "4th Digit of Time (---:0-) Y", 2),
     ("text_time_sec2",  "8", 140, 23, 20, "Time Text Size", "Time Text Color",
      False, "5th Digit of Time (---:-0) X", -265, "5th Digit of Time (---:-0) Y", 2),
-    ("text_added_time", "+9", 120, 67, 22, "PlaceHolder", None, # design_font_size 22, no specific game offset link
+    ("text_added_time", "+9", 120, 67, 22, "PlaceHolder", "Added Time Text Color", # Linked to the special text color
      False, "Added Time X", 130, "Added Time Y", 83),
 ]
+
+SPECIAL_TEXT_COLOR_LABELS = ["Added Time Text Color"] # Labels that are text-based, not hex
 
 predefined_image_coords: Dict[str, tuple[float, float, Optional[str], Optional[float], Optional[str], Optional[float]]] = {
     "img_10":       (5.0, 5.0, None, None, None, None),
     "img_14":       (104, 51, None, None, None, None),
     "img_30_orig":  (135, 8, "Home Color Bar X", 212, "Home Color Bar Y", 103.5),
-    "img_30_dup":   (436, 8, "Away Color Bar X", 502, "Away Color Bar Y", 103.5)
+    "img_30_dup":   (426, 8, "Away Color Bar X", 502, "Away Color Bar Y", 103.5)
 }
 
 highlighted_offset_entries = []
@@ -170,14 +172,25 @@ class UndoManager:
                     is_offset_var = True
                     break
         if not is_offset_var and hasattr(root, 'color_vars'):
-            for key, var in root.color_vars.items():
-                if var == action_to_apply.string_var:
-                    update_color_preview_from_entry(key, action_to_apply.string_var, from_undo_redo=True)
+            # Find the JSON label for this color var to determine if it's special
+            color_json_label = None
+            for lbl, c_key_tuple in colors.items(): # colors maps JSON label to address tuple
+                if tuple(c_key_tuple) == action_to_apply.key_tuple:
+                    color_json_label = lbl
                     break
-        if action_to_apply.entry_widget_ref and isinstance(action_to_apply.entry_widget_ref, tk.Entry):
+            
+            if color_json_label in SPECIAL_TEXT_COLOR_LABELS:
+                 # This var is for a Combobox (WHITE/BLACK)
+                 handle_special_text_color_change(action_to_apply.key_tuple, action_to_apply.string_var, from_undo_redo=True)
+            else:
+                # This var is for a hex color Entry
+                update_color_preview_from_entry(action_to_apply.key_tuple, action_to_apply.string_var, from_undo_redo=True)
+
+        if action_to_apply.entry_widget_ref and isinstance(action_to_apply.entry_widget_ref, tk.Entry): # Or ttk.Combobox
             try:
                 action_to_apply.entry_widget_ref.focus_set()
-                action_to_apply.entry_widget_ref.selection_range(0, tk.END)
+                if isinstance(action_to_apply.entry_widget_ref, tk.Entry):
+                    action_to_apply.entry_widget_ref.selection_range(0, tk.END)
             except tk.TclError:
                 logging.debug("TclError focusing widget during undo/redo.")
         self.update_menu_states()
@@ -227,12 +240,19 @@ class BinaryReader:
         if self.pos + c > len(self.data): raise ValueError(f"EOS int{c}")
         chunk = self.data[self.pos:self.pos+c]; self.pos += c
         return int.from_bytes(chunk, "big" if be else "little")
-    def read_string(self, enc: str) -> str:
-        s = self.pos
-        while self.pos < len(self.data) and self.data[self.pos] != 0: self.pos += 1
-        b = self.data[s:self.pos]
-        if self.pos < len(self.data) and self.data[self.pos] == 0: self.pos += 1
-        return b.decode(enc, errors="ignore")
+    def read_string(self, enc: str, length: Optional[int] = None) -> str: # Added length param
+        if length is not None:
+            if self.pos + length > len(self.data):
+                raise ValueError(f"Not enough data to read string of length {length}")
+            b = self.data[self.pos : self.pos + length]
+            self.pos += length
+            return b.decode(enc, errors="ignore").rstrip('\x00') #rstrip for potential nulls if fixed length
+        else: # Null-terminated
+            s = self.pos
+            while self.pos < len(self.data) and self.data[self.pos] != 0: self.pos += 1
+            b = self.data[s:self.pos]
+            if self.pos < len(self.data) and self.data[self.pos] == 0: self.pos += 1
+            return b.decode(enc, errors="ignore")
     def skip(self, c: int): self.pos = min(len(self.data), self.pos + c)
 
 class Decompressor:
@@ -436,7 +456,7 @@ def on_drag_single(event):
     drag_data["x"]=event.x; drag_data["y"]=event.y; redraw_single_view_image()
 
 def load_current_values():
-    global file_path,original_loaded_offsets,original_loaded_colors
+    global file_path,original_loaded_offsets,original_loaded_colors, colors # Added colors global
     if not file_path or not hasattr(root,'offsets_vars') or not hasattr(root,'color_vars'): return
     original_loaded_offsets.clear(); original_loaded_colors.clear()
     try:
@@ -448,16 +468,39 @@ def load_current_values():
                     val_str=f"{val:.2f}";var_obj.set(val_str);original_loaded_offsets[off_tuple]=val_str
                     if off_tuple in root.asterisk_labels: root.asterisk_labels[off_tuple].config(text="")
                 except Exception: var_obj.set("ERR")
-            for off_tuple,var_obj in root.color_vars.items():
-                if not off_tuple: continue
+            
+            # Find the JSON label for each color offset tuple to check if it's special
+            for color_label, off_tuple_list in colors.items(): # Iterate through loaded color config
+                off_tuple = tuple(off_tuple_list)
+                if off_tuple not in root.color_vars: continue # Should not happen if setup is correct
+
+                var_obj = root.color_vars[off_tuple]
                 try:
-                    file.seek(off_tuple[0]);data=file.read(4)
-                    hex_col=f'#{data[2]:02X}{data[1]:02X}{data[0]:02X}'
-                    var_obj.set(hex_col);original_loaded_colors[off_tuple]=hex_col
-                    if off_tuple in root.color_previews: root.color_previews[off_tuple].config(bg=hex_col)
+                    file.seek(off_tuple[0])
+                    if color_label in SPECIAL_TEXT_COLOR_LABELS:
+                        data_bytes = file.read(5) # Read 5 bytes for text color
+                        text_color_val = data_bytes.decode('ascii', errors='ignore').strip()
+                        if text_color_val in ["WHITE", "BLACK"]:
+                            var_obj.set(text_color_val)
+                            original_loaded_colors[off_tuple] = text_color_val
+                        else:
+                            var_obj.set("ERR_TXT") # Error for special text color
+                            original_loaded_colors[off_tuple] = "ERR_TXT"
+                        # No color swatch for combobox, but ensure asterisk is cleared
+                    else: # Regular hex color
+                        data_bytes = file.read(4) # BGRA
+                        hex_col=f'#{data_bytes[2]:02X}{data_bytes[1]:02X}{data_bytes[0]:02X}'
+                        var_obj.set(hex_col);original_loaded_colors[off_tuple]=hex_col
+                        if off_tuple in root.color_previews: root.color_previews[off_tuple].config(bg=hex_col)
+                    
                     if off_tuple in root.asterisk_labels: root.asterisk_labels[off_tuple].config(text="")
-                except Exception: var_obj.set("#ERR")
+
+                except Exception as e:
+                     var_obj.set("#ERR_LOAD" if color_label not in SPECIAL_TEXT_COLOR_LABELS else "ERR_LOAD_TXT")
+                     logging.error(f"Error loading color/text for {color_label} at {off_tuple}: {e}")
+
     except Exception as e: messagebox.showerror("Error",f"Failed to read values: {e}")
+
 
 def add_internal_name():
     global file_path,previous_file_path,offsets,colors,current_reference_width,current_reference_height,composite_mode_active
@@ -494,15 +537,19 @@ def add_internal_name():
 def clear_editor_widgets():
     for frame in [positions_frame,sizes_frame,colors_frame]:
         for widget in frame.winfo_children(): widget.destroy()
-    for attr in ['offsets_vars','color_vars','color_previews','offset_entry_widgets','asterisk_labels']:
+    for attr in ['offsets_vars','color_vars','color_previews','offset_entry_widgets','asterisk_labels', 'color_comboboxes']:
         if hasattr(root,attr): getattr(root,attr).clear()
 
 def recreate_widgets():
     clear_editor_widgets()
-    global offsets,colors
+    global offsets,colors, SPECIAL_TEXT_COLOR_LABELS
     root.offsets_vars={tuple(v):tk.StringVar() for v in offsets.values()}
-    root.color_vars={tuple(v):tk.StringVar(value='#000000') for v in colors.values()}
-    root.color_previews={};root.offset_entry_widgets={};root.asterisk_labels={}
+    root.color_vars={ # StringVars for all color types
+        tuple(v_list): tk.StringVar(value='#000000' if lbl not in SPECIAL_TEXT_COLOR_LABELS else "WHITE") 
+        for lbl, v_list in colors.items()
+    }
+    root.color_previews={}; root.offset_entry_widgets={}; root.asterisk_labels={}
+    root.color_comboboxes = {} # To store references to comboboxes if needed
 
     def make_offset_update_lambda(key_tuple,var,entry_widget):
         def on_offset_update(event=None):
@@ -537,42 +584,30 @@ def recreate_widgets():
     row_p=0; row_s=0 
     for lbl,off_list in offsets.items():
         key_tuple=tuple(off_list)
-        # Corrected: "Font Size" should be "Size" in JSON keys for fonts for this logic.
-        # Or, adjust this check if JSON uses "Font Size"
-        is_font_related_size = "Size" in lbl and ("Font" in lbl or "Text" in lbl or "Team Name" in lbl or "Score" in lbl)
+        is_font_related_size = "Size" in lbl and ("Font" in lbl or "Text" in lbl or "Team Name" in lbl or "Score" in lbl or "Added Time" in lbl)
 
+        target_frame = None; current_row_ref = None 
+        base_col_for_entry = 1; col_for_asterisk = 2   
 
-        target_frame = None
-        current_row_ref = None 
-        base_col_for_entry = 1 
-        col_for_asterisk = 2   
-
-        if is_font_related_size: # Font Sizes specifically
-            target_frame = sizes_frame
-            current_row_ref = row_s
+        if is_font_related_size: 
+            target_frame = sizes_frame; current_row_ref = row_s
             tk.Label(target_frame,text=lbl).grid(row=row_s,column=0,padx=5,pady=5,sticky="w")
             entry=tk.Entry(target_frame,textvariable=root.offsets_vars[key_tuple],width=10)
-            entry.grid(row=row_s,column=1,padx=0,pady=5)
-            row_s +=1
-        elif "Size" in lbl : # Other general sizes (e.g., "Image Width Size")
-            target_frame = sizes_frame
-            current_row_ref = row_s
+            entry.grid(row=row_s,column=1,padx=0,pady=5); row_s +=1
+        elif "Size" in lbl : 
+            target_frame = sizes_frame; current_row_ref = row_s
             tk.Label(target_frame,text=lbl).grid(row=row_s,column=0,padx=5,pady=5,sticky="w")
             entry=tk.Entry(target_frame,textvariable=root.offsets_vars[key_tuple],width=10)
-            entry.grid(row=row_s,column=1,padx=0,pady=5)
-            row_s +=1
-        elif not lbl.startswith("Image_"): # Positions (X, Y, Width, Height that are not "Size")
-            target_frame = positions_frame
-            current_row_ref = row_p
+            entry.grid(row=row_s,column=1,padx=0,pady=5); row_s +=1
+        elif not lbl.startswith("Image_"): 
+            target_frame = positions_frame; current_row_ref = row_p
             col=0 if "X" in lbl or "Width" in lbl else 4 
             tk.Label(target_frame,text=lbl).grid(row=row_p,column=col,padx=5,pady=5,sticky="w")
             entry=tk.Entry(target_frame,textvariable=root.offsets_vars[key_tuple],width=10)
             entry.grid(row=row_p,column=col+1,padx=0,pady=5)
-            base_col_for_entry = col + 1 
-            col_for_asterisk = col+2
+            base_col_for_entry = col + 1; col_for_asterisk = col+2
             if col==4 or "Y" in lbl or "Height" in lbl: row_p+=1
-        else: 
-            continue 
+        else: continue 
         
         if target_frame: 
             update_lambda=make_offset_update_lambda(key_tuple,root.offsets_vars[key_tuple],entry)
@@ -585,72 +620,111 @@ def recreate_widgets():
             root.offset_entry_widgets[key_tuple]=entry
             
     row_c=0
-    for lbl,off_list in colors.items():
+    for lbl,off_list in colors.items(): # colors is {"Label": [addr1, addr2]}
         key_tuple=tuple(off_list)
         tk.Label(colors_frame,text=lbl).grid(row=row_c,column=0,padx=5,pady=5,sticky="w")
-        entry=tk.Entry(colors_frame,textvariable=root.color_vars[key_tuple],width=10)
-        entry.grid(row=row_c,column=1,padx=0,pady=5)
-        def make_color_update_lambda(k_t,var,entry_w):
-            def on_color_update(event=None):
-                old_val=original_loaded_colors.get(k_t,"")
-                new_val=var.get()
-                is_focus_out_after_key=(event and event.type==tk.EventType.FocusOut and hasattr(entry_w,'_undo_recorded_for_this_change') and entry_w._undo_recorded_for_this_change)
-                if old_val!=new_val and not is_focus_out_after_key:
-                    if not (event and event.type==tk.EventType.FocusOut):
-                        action=EditAction(var,old_val,new_val,k_t,entry_w,f"Color change for {k_t}")
+        
+        current_var = root.color_vars[key_tuple]
+
+        if lbl in SPECIAL_TEXT_COLOR_LABELS:
+            combo = ttk.Combobox(colors_frame, textvariable=current_var, values=["WHITE", "BLACK"], width=8, state="readonly")
+            combo.grid(row=row_c, column=1, padx=0, pady=5)
+            root.color_comboboxes[key_tuple] = combo # Store ref to combobox
+            # No color swatch for combobox, so place asterisk directly after
+            asterisk_col_idx = 2 
+            
+            def make_combo_change_lambda(k_t, var_obj, combo_ref):
+                def on_combo_change(event=None):
+                    old_val = original_loaded_colors.get(k_t, "WHITE") # Default if not found
+                    new_val = var_obj.get()
+                    if old_val != new_val:
+                        action = EditAction(var_obj, old_val, new_val, k_t, combo_ref, f"Text color change for {lbl}")
                         undo_manager.record_action(action)
-                    if event and event.type==tk.EventType.KeyRelease: entry_w._undo_recorded_for_this_change=True
-                update_color_preview_from_entry(k_t,var)
-                if event and event.type==tk.EventType.FocusOut:
-                    if hasattr(entry_w,'_undo_recorded_for_this_change'): delattr(entry_w,'_undo_recorded_for_this_change')
-            return on_color_update
-        color_update_lambda=make_color_update_lambda(key_tuple,root.color_vars[key_tuple],entry)
-        entry.bind('<KeyPress>',lambda e,v=root.color_vars[key_tuple]:restrict_color_entry(e,v))
-        entry.bind('<KeyRelease>',color_update_lambda); entry.bind("<FocusOut>",color_update_lambda)
-        preview_lbl=tk.Label(colors_frame,bg=root.color_vars[key_tuple].get(),width=3,height=1,relief="sunken")
-        preview_lbl.grid(row=row_c,column=2,padx=5,pady=5)
-        def make_choose_color_lambda(k_t,var_obj,preview_widget,entry_ref):
-            def on_choose_color(event=None):
-                old_color=var_obj.get(); choose_color(k_t,var_obj,preview_widget); new_color=var_obj.get()
-                if old_color!=new_color:
-                    action=EditAction(var_obj,old_color,new_color,k_t,entry_ref,f"Choose color for {k_t}")
-                    undo_manager.record_action(action)
-            return on_choose_color
-        preview_lbl.bind("<Button-1>",make_choose_color_lambda(key_tuple,root.color_vars[key_tuple],preview_lbl,entry))
-        root.color_previews[key_tuple]=preview_lbl
+                    handle_special_text_color_change(k_t, var_obj)
+                return on_combo_change
+            combo.bind("<<ComboboxSelected>>", make_combo_change_lambda(key_tuple, current_var, combo))
+
+        else: # Regular hex color entry
+            entry=tk.Entry(colors_frame,textvariable=current_var,width=10)
+            entry.grid(row=row_c,column=1,padx=0,pady=5)
+            def make_color_update_lambda(k_t,var,entry_w): # For hex entry
+                def on_color_update(event=None):
+                    old_val=original_loaded_colors.get(k_t,"")
+                    new_val=var.get()
+                    is_focus_out_after_key=(event and event.type==tk.EventType.FocusOut and hasattr(entry_w,'_undo_recorded_for_this_change') and entry_w._undo_recorded_for_this_change)
+                    if old_val!=new_val and not is_focus_out_after_key:
+                        if not (event and event.type==tk.EventType.FocusOut):
+                            action=EditAction(var,old_val,new_val,k_t,entry_w,f"Hex color change for {lbl}")
+                            undo_manager.record_action(action)
+                        if event and event.type==tk.EventType.KeyRelease: entry_w._undo_recorded_for_this_change=True
+                    update_color_preview_from_entry(k_t,var)
+                    if event and event.type==tk.EventType.FocusOut:
+                        if hasattr(entry_w,'_undo_recorded_for_this_change'): delattr(entry_w,'_undo_recorded_for_this_change')
+                return on_color_update
+            color_update_lambda=make_color_update_lambda(key_tuple,current_var,entry)
+            entry.bind('<KeyPress>',lambda e,v=current_var:restrict_color_entry(e,v))
+            entry.bind('<KeyRelease>',color_update_lambda); entry.bind("<FocusOut>",color_update_lambda)
+            
+            preview_lbl=tk.Label(colors_frame,bg=current_var.get(),width=3,height=1,relief="sunken")
+            preview_lbl.grid(row=row_c,column=2,padx=5,pady=5)
+            def make_choose_color_lambda(k_t,var_obj,preview_widget,entry_ref):
+                def on_choose_color(event=None):
+                    old_color=var_obj.get(); choose_color(k_t,var_obj,preview_widget); new_color=var_obj.get()
+                    if old_color!=new_color:
+                        action=EditAction(var_obj,old_color,new_color,k_t,entry_ref,f"Choose color for {lbl}")
+                        undo_manager.record_action(action)
+                return on_choose_color
+            preview_lbl.bind("<Button-1>",make_choose_color_lambda(key_tuple,current_var,preview_lbl,entry))
+            root.color_previews[key_tuple]=preview_lbl
+            asterisk_col_idx = 3 # Asterisk after swatch
+
         asterisk_lbl_color=tk.Label(colors_frame,text="",fg="red",width=1)
-        asterisk_lbl_color.grid(row=row_c,column=3,padx=(0,5),pady=5,sticky="w")
+        asterisk_lbl_color.grid(row=row_c,column=asterisk_col_idx,padx=(0,5),pady=5,sticky="w")
         root.asterisk_labels[key_tuple]=asterisk_lbl_color; row_c+=1
 
 def save_file():
-    global file_path,original_loaded_offsets,original_loaded_colors
+    global file_path,original_loaded_offsets,original_loaded_colors, colors, SPECIAL_TEXT_COLOR_LABELS
     if not file_path: messagebox.showerror("Error","No file."); return
     if not hasattr(root,'offsets_vars') or not hasattr(root,'color_vars'): messagebox.showerror("Error","Data not init."); return
     try:
         with open(file_path,'r+b') as f:
             for off_key,var_obj in root.offsets_vars.items():
                 val_str=var_obj.get()
-                try:
-                    val_f=float(val_str); packed=struct.pack('<f',val_f)
+                try: val_f=float(val_str); packed=struct.pack('<f',val_f)
                 except ValueError: messagebox.showerror("Save Err",f"Bad float '{val_str}' for {off_key}"); return
                 for addr in off_key: f.seek(addr); f.write(packed)
                 original_loaded_offsets[off_key]=val_str
                 if off_key in root.asterisk_labels: root.asterisk_labels[off_key].config(text="")
-            for off_key,var_obj in root.color_vars.items():
-                hex_str=var_obj.get()
-                if not (len(hex_str)==7 and hex_str.startswith('#')):
-                    messagebox.showerror("Save Err",f"Bad color '{hex_str}' for {off_key}"); return
-                try:
-                    r_val,g_val,b_val=int(hex_str[1:3],16),int(hex_str[3:5],16),int(hex_str[5:7],16)
-                    bgra=bytes([b_val,g_val,r_val,0xFF]) 
-                except ValueError: messagebox.showerror("Save Err",f"Bad hex '{hex_str}' for {off_key}"); return
-                for addr in off_key: f.seek(addr); f.write(bgra)
-                original_loaded_colors[off_key]=hex_str
+            
+            for color_label, off_tuple_list in colors.items(): # Iterate using label to check against SPECIAL_TEXT_COLOR_LABELS
+                off_key = tuple(off_tuple_list)
+                if off_key not in root.color_vars: continue
+                var_obj = root.color_vars[off_key]
+                
+                if color_label in SPECIAL_TEXT_COLOR_LABELS:
+                    text_val = var_obj.get() # Should be "WHITE" or "BLACK"
+                    if text_val in ["WHITE", "BLACK"]:
+                        bytes_to_write = text_val.encode('ascii').ljust(5, b'\x00')[:5] # Ensure 5 bytes
+                        for addr in off_key: f.seek(addr); f.write(bytes_to_write)
+                        original_loaded_colors[off_key]=text_val
+                    else: messagebox.showerror("Save Err",f"Invalid text color '{text_val}' for {color_label}"); return
+                else: # Regular hex color
+                    hex_str=var_obj.get()
+                    if not (len(hex_str)==7 and hex_str.startswith('#')):
+                        messagebox.showerror("Save Err",f"Bad color '{hex_str}' for {color_label}"); return
+                    try:
+                        r_val,g_val,b_val=int(hex_str[1:3],16),int(hex_str[3:5],16),int(hex_str[5:7],16)
+                        bgra=bytes([b_val,g_val,r_val,0xFF]) 
+                    except ValueError: messagebox.showerror("Save Err",f"Bad hex '{hex_str}' for {color_label}"); return
+                    for addr in off_key: f.seek(addr); f.write(bgra)
+                    original_loaded_colors[off_key]=hex_str
+                
                 if off_key in root.asterisk_labels: root.asterisk_labels[off_key].config(text="")
         update_status("File saved successfully.","green"); undo_manager.clear_history()
     except Exception as e: messagebox.showerror("Save Err",f"Open/Save fail: {e}")
 
-def update_value(offset_key_tuple, string_var, from_undo_redo=False):
+
+def update_value(offset_key_tuple, string_var, from_undo_redo=False): # For numerical offsets
     global composite_mode_active, composite_elements, offsets
     global original_loaded_offsets
     
@@ -658,7 +732,7 @@ def update_value(offset_key_tuple, string_var, from_undo_redo=False):
     if not from_undo_redo: logging.debug(f"update_value for {offset_key_tuple} with '{val_str}'")
     
     try:
-        new_game_offset_val = float(val_str) # This is the IN-GAME value (e.g. 36 for font size)
+        new_game_offset_val = float(val_str) 
     except ValueError:
         if not from_undo_redo: update_status(f"Invalid float '{val_str}'", "red")
         if offset_key_tuple in root.asterisk_labels: root.asterisk_labels[offset_key_tuple].config(text="!")
@@ -677,32 +751,24 @@ def update_value(offset_key_tuple, string_var, from_undo_redo=False):
 
     if composite_mode_active:
         visual_updated_overall = False 
-        
         current_offset_json_label = None
         for label, off_list in offsets.items():
             if tuple(off_list) == offset_key_tuple:
                 current_offset_json_label = label
                 break
-        
-        if not current_offset_json_label:
-            logging.warning(f"Could not find JSON label for offset key {offset_key_tuple} during update_value.")
-            return 
+        if not current_offset_json_label: return
 
-        # Adjusted condition to match typical JSON labels like "Home Team Name Size"
         is_this_a_font_size_update = " Size" in current_offset_json_label and \
                                    any(keyword in current_offset_json_label for keyword in ["Font", "Text", "Name", "Score"])
 
-
         for el_data in composite_elements:
             element_was_modified = False
-
             is_x_offset = (el_data.get('x_offset_label_linked') == current_offset_json_label)
             is_y_offset = (el_data.get('y_offset_label_linked') == current_offset_json_label)
 
             if is_x_offset or is_y_offset:
                 gui_ref_x, gui_ref_y = el_data.get('gui_ref_x'), el_data.get('gui_ref_y')
                 base_game_x, base_game_y = el_data.get('base_game_x'), el_data.get('base_game_y')
-                
                 if gui_ref_x is not None and gui_ref_y is not None:
                     if is_x_offset and base_game_x is not None:
                         el_data['original_x'] = float(gui_ref_x) + (new_game_offset_val - base_game_x)
@@ -710,9 +776,8 @@ def update_value(offset_key_tuple, string_var, from_undo_redo=False):
                     if is_y_offset and base_game_y is not None:
                         el_data['original_y'] = float(gui_ref_y) + (new_game_offset_val - base_game_y)
                         element_was_modified = True
-                
                 if element_was_modified:
-                    logging.info(f"Comp: Position for '{el_data.get('display_tag')}' updated via Entry.")
+                    logging.info(f"Comp: Pos for '{el_data.get('display_tag')}' updated.")
                     leader_tag = el_data.get('display_tag')
                     if leader_tag:
                         for follower_elem in composite_elements:
@@ -722,19 +787,13 @@ def update_value(offset_key_tuple, string_var, from_undo_redo=False):
             
             if is_this_a_font_size_update and el_data.get('type') == "text" and \
                el_data.get('font_size_offset_label_linked') == current_offset_json_label:
-                
-                gui_render_font_size = new_game_offset_val / 1.5 # Convert in-game value to GUI render value
+                gui_render_font_size = new_game_offset_val / 1.5 
                 el_data['base_font_size'] = gui_render_font_size 
                 element_was_modified = True
                 logging.info(f"Comp: Font for {el_data.get('display_tag')} (link: '{current_offset_json_label}') "
                              f"updated. Game val: {new_game_offset_val} -> GUI render: {gui_render_font_size:.2f}")
-
-            if element_was_modified:
-                visual_updated_overall = True
-        
-        if visual_updated_overall:
-            redraw_composite_view()
-
+            if element_was_modified: visual_updated_overall = True
+        if visual_updated_overall: redraw_composite_view()
 
 def increment_value(event, str_var, direction):
     try:
@@ -748,38 +807,75 @@ def increment_value(event, str_var, direction):
             
         if direction=='Up': value_float+=increment_amt
         elif direction=='Down': value_float-=increment_amt
-        str_var.set(f"{value_float:.4f}")
+        str_var.set(f"{value_float:.4f}") # update_value will be called by the KeyRelease binding
     except ValueError: update_status("Invalid value for increment","red")
 
-def update_color_preview_from_entry(off_key, str_var, from_undo_redo=False):
-    global original_loaded_colors
-    hex_str=str_var.get(); valid_hex=False
-    if len(hex_str)==7 and hex_str.startswith('#'):
-        try:
-            int(hex_str[1:],16); valid_hex=True
-            if hasattr(root,'color_previews') and off_key in root.color_previews:
-                root.color_previews[off_key].config(bg=hex_str)
-            if not from_undo_redo: update_status("Color preview updated","blue")
-            if composite_mode_active: redraw_composite_view()
-        except ValueError:
-            if not from_undo_redo: update_status("Bad hex color","red")
-    elif not from_undo_redo and len(hex_str)>0 and not hex_str.startswith('#') and \
-         all(c in "0123456789abcdefABCDEF" for c in hex_str) and len(hex_str)<=6:
-        str_var.set("#"+hex_str.upper()); update_color_preview_from_entry(off_key,str_var,from_undo_redo)
-        return 
-    if off_key in root.asterisk_labels:
-        original_color=original_loaded_colors.get(off_key)
-        is_changed=(original_color.lower()!=hex_str.lower()) if valid_hex and original_color else True
-        root.asterisk_labels[off_key].config(text="*" if is_changed else "")
 
-def choose_color(off_key, str_var, preview_widget):
-    old_color=str_var.get(); curr_hex=old_color
-    if not (curr_hex.startswith("#") and len(curr_hex)==7): curr_hex="#000000"
-    new_color_tuple=colorchooser.askcolor(initialcolor=curr_hex, title="Choose Color")
-    if new_color_tuple and new_color_tuple[1]:
-        chosen_hex=new_color_tuple[1].lower()
-        str_var.set(chosen_hex)
-        update_color_preview_from_entry(off_key, str_var)
+# This function handles updates from regular hex color entries
+def update_color_preview_from_entry(off_key_tuple, str_var, from_undo_redo=False):
+    global original_loaded_colors, composite_mode_active
+    hex_color_str = str_var.get()
+    is_valid_hex = False
+
+    if len(hex_color_str) == 7 and hex_color_str.startswith('#'):
+        try:
+            int(hex_color_str[1:], 16) # Validate actual hex
+            is_valid_hex = True
+            if hasattr(root, 'color_previews') and off_key_tuple in root.color_previews:
+                root.color_previews[off_key_tuple].config(bg=hex_color_str)
+            if not from_undo_redo:
+                update_status("Color preview updated.", "blue")
+            if composite_mode_active: 
+                redraw_composite_view() # Redraw if a hex color linked to a text element changes
+        except ValueError: 
+            if not from_undo_redo:
+                update_status("Invalid hex color code.", "red")
+    elif not from_undo_redo and len(hex_color_str) > 0 and not hex_color_str.startswith('#') and \
+         all(c in "0123456789abcdefABCDEF" for c in hex_color_str) and len(hex_color_str) <= 6:
+        str_var.set("#" + hex_color_str.upper()) 
+        update_color_preview_from_entry(off_key_tuple, str_var, from_undo_redo) 
+        return 
+
+    if off_key_tuple in root.asterisk_labels:
+        original_color_val = original_loaded_colors.get(off_key_tuple)
+        is_changed = True 
+        if is_valid_hex and original_color_val:
+            is_changed = (original_color_val.lower() != hex_color_str.lower())
+        elif not is_valid_hex and original_color_val == "ERR_LOAD": # If it was error and still error, not changed
+             is_changed = False
+        root.asterisk_labels[off_key_tuple].config(text="*" if is_changed else "")
+
+# This new function handles updates from the "WHITE"/"BLACK" combobox
+def handle_special_text_color_change(off_key_tuple, str_var, from_undo_redo=False):
+    global original_loaded_colors, composite_mode_active
+    text_color_value = str_var.get() # "WHITE" or "BLACK"
+
+    if not from_undo_redo:
+        update_status(f"Text color set to {text_color_value}.", "blue")
+    
+    if composite_mode_active:
+        redraw_composite_view() # Redraw if this special text color changes
+
+    if off_key_tuple in root.asterisk_labels:
+        original_val = original_loaded_colors.get(off_key_tuple)
+        is_changed = (original_val != text_color_value) if original_val else True
+        root.asterisk_labels[off_key_tuple].config(text="*" if is_changed else "")
+
+
+def choose_color(off_key_tuple, str_var, preview_widget_ref): # For hex colors
+    old_color_hex = str_var.get()
+    current_color_for_dialog = old_color_hex
+    if not (current_color_for_dialog.startswith("#") and len(current_color_for_dialog) == 7):
+        current_color_for_dialog = "#000000" 
+    
+    new_color_tuple_result = colorchooser.askcolor(initialcolor=current_color_for_dialog, title="Choose Color")
+    
+    if new_color_tuple_result and new_color_tuple_result[1]: 
+        chosen_hex_color = new_color_tuple_result[1].lower() 
+        # Undo is handled by the calling lambda (make_choose_color_lambda)
+        str_var.set(chosen_hex_color)
+        update_color_preview_from_entry(off_key_tuple, str_var)
+
 
 def update_status(msg,fg_col): status_label.config(text=msg,fg=fg_col)
 
@@ -787,7 +883,7 @@ def about():
     win=tk.Toplevel(root); win.title("About FLP Scoreboard Editor 25"); win.geometry("450x300")
     win.resizable(False,False); win.transient(root); win.grab_set()
     tk.Label(win,text="FLP Scoreboard Editor 25",pady=10,font=("Helvetica",12,"bold")).pack()
-    tk.Label(win,text="Version 1.13 [Build 10 May 2025]",pady=5).pack()
+    tk.Label(win,text="Version 1.13 [Build 12 May 2025]",pady=5).pack()
     tk.Label(win,text="© 2025 FIFA Legacy Project. All Rights Reserved.",pady=5).pack()
     tk.Label(win,text="Designed & Developed By: Emran_Ahm3d",pady=5).pack()
     tk.Label(win,text="Special Thanks: Riesscar, KO, MCK, Marconis (Research)",pady=5,wraplength=400).pack()
@@ -988,7 +1084,7 @@ def clear_composite_view():
     composite_elements.clear(); preview_canvas.config(bg="#CCCCCC")
 
 def redraw_composite_view():
-    global composite_elements,preview_canvas,composite_zoom_level,composite_pan_offset_x,composite_pan_offset_y,colors,root
+    global composite_elements,preview_canvas,composite_zoom_level,composite_pan_offset_x,composite_pan_offset_y,colors,root, SPECIAL_TEXT_COLOR_LABELS
     preview_canvas.delete("composite_item"); canvas_w=preview_canvas.winfo_width(); canvas_h=preview_canvas.winfo_height()
     if canvas_w<=1: canvas_w=580
     if canvas_h<=1: canvas_h=150
@@ -1002,15 +1098,20 @@ def redraw_composite_view():
             base_font_sz=el_data.get('base_font_size',DEFAULT_TEXT_BASE_FONT_SIZE) 
             zoomed_font_sz=max(1,int(base_font_sz*composite_zoom_level))
             font_fam=el_data.get('font_family',DEFAULT_TEXT_FONT_FAMILY); text_col=DEFAULT_TEXT_COLOR_FALLBACK
-            color_label_key=el_data.get('color_offset_label')
+            
+            color_label_key=el_data.get('color_offset_label') # This is the JSON key, e.g., "Added Time Text Color"
             if color_label_key and color_label_key in colors and hasattr(root,'color_vars'):
-                color_json_key_tuple=tuple(colors[color_label_key])
+                color_json_key_tuple=tuple(colors[color_label_key]) # This is the address tuple
                 if color_json_key_tuple in root.color_vars:
-                    current_hex_val=root.color_vars[color_json_key_tuple].get()
-                    if current_hex_val and current_hex_val.startswith("#") and len(current_hex_val)==7: text_col=current_hex_val
-                    else: logging.warning(f"Invalid hex '{current_hex_val}' for '{color_label_key}'.")
+                    current_color_val_from_var = root.color_vars[color_json_key_tuple].get()
+                    if color_label_key in SPECIAL_TEXT_COLOR_LABELS:
+                        text_col = current_color_val_from_var.lower() # "white" or "black"
+                    elif current_color_val_from_var and current_color_val_from_var.startswith("#") and len(current_color_val_from_var)==7:
+                        text_col=current_color_val_from_var
+                    else: logging.warning(f"Invalid hex '{current_color_val_from_var}' for '{color_label_key}'.")
                 else: logging.warning(f"Var for key {color_json_key_tuple} ({color_label_key}) not in root.color_vars.")
             elif color_label_key: logging.warning(f"Color label '{color_label_key}' not in 'colors' dict.")
+            
             item_id=preview_canvas.create_text(int(screen_x),int(screen_y),anchor=tk.NW,text=el_data['text_content'],
                                                  font=(font_fam,zoomed_font_sz,"bold"),fill=text_col,
                                                  tags=("composite_item",el_data['display_tag']))
@@ -1029,7 +1130,7 @@ def redraw_composite_view():
         else: logging.warning(f"Unknown element type: {el_data.get('type')}")
 
 def display_composite_view():
-    global composite_elements,preview_canvas,file_path,composite_mode_active,initial_text_elements_config,predefined_image_coords,offsets,root,current_reference_width,current_reference_height
+    global composite_elements,preview_canvas,file_path,composite_mode_active,initial_text_elements_config,predefined_image_coords,offsets,root,current_reference_width,current_reference_height, SPECIAL_TEXT_COLOR_LABELS
     logging.info("Attempting display_composite_view.")
     if not file_path: composite_mode_active=False; return
     preview_canvas.config(bg="gray70")
