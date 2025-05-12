@@ -2,7 +2,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser
 import struct
 import webbrowser
-# import struct # Duplicate import removed
 import os
 import tempfile
 from PIL import Image, ImageTk
@@ -10,1165 +9,1327 @@ import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import List
+from typing import List, Optional, Dict, Any
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s')
 
 # Load offsets from JSON file
 try:
     with open('offsets.json', 'r') as f:
         offsets_data = json.load(f)
 except FileNotFoundError:
-    logging.error("offsets.json not found. Please ensure the file exists in the same directory.")
-    messagebox.showerror("Error", "offsets.json not found. The application cannot start.")
-    exit() # Exit if critical config is missing
+    logging.warning(
+        "offsets.json not found in default path. Prompting user.")
+    messagebox.showwarning("File not found",
+                           "offsets.json not found in default location. Please select manually.")
+    _temp_root_for_dialog = tk.Tk()
+    _temp_root_for_dialog.withdraw() # Hide the temporary root window
+    file_path_json = filedialog.askopenfilename(
+        title="Select offsets.json file", filetypes=[("JSON files", "*.json")])
+    _temp_root_for_dialog.destroy()
+
+    if not file_path_json:
+        messagebox.showerror(
+            "Error", "No offsets.json selected. Application will exit.")
+        exit()
+    try:
+        with open(file_path_json, 'r') as f:
+            offsets_data = json.load(f)
+    except json.JSONDecodeError:
+        logging.error("Error decoding selected offsets.json.")
+        messagebox.showerror(
+            "Error", "Error reading selected offsets.json file. The application will be terminated.")
+        exit()
+    except FileNotFoundError:
+        logging.error("Selected offsets.json somehow not found.")
+        messagebox.showerror(
+            "Error", "Selected offsets.json file not found. The application will be terminated.")
+        exit()
+
 except json.JSONDecodeError:
-    logging.error("Error decoding offsets.json. Please check its format.")
-    messagebox.showerror("Error", "Error decoding offsets.json. The application cannot start.")
+    logging.error("Error decoding default offsets.json.")
+    messagebox.showerror(
+        "Error", "Error reading default offsets.json file. The application will be terminated.")
     exit()
 
+file_path: Optional[str] = None
+offsets = {}
+colors = {}
+current_image: Optional[Image.Image] = None
 
-file_path = None
-offsets = {} # Loaded from json based on internal name
-colors = {}  # Loaded from json based on internal name
-current_image = None  # Store original PIL Image object for zooming/panning
-# New global variables to store the previous file path and values
-previous_file_path = None
-previous_offsets_values = {} # Stores {offset_tuple_key: value_str}
-previous_color_values = {}   # Stores {offset_tuple_key: color_hex_str}
-preview_bg_color_is_white = True # True for white (default), False for black
+original_loaded_offsets = {}
+original_loaded_colors = {}
 
-class Compression(Enum):
-    NONE = "None"
-    EAHD = "EAHD"
+preview_bg_color_is_white = True
+current_image_index = 0
+image_files = [str(i) for i in range(1, 81)]
+
+single_view_zoom_level = 1.0
+single_view_pan_offset_x = 0.0
+single_view_pan_offset_y = 0.0
+drag_data = {"x": 0, "y": 0, "item": None,
+             "is_panning": False, "is_panning_rmb": False}
+
+composite_mode_active = False
+composite_elements: List[Dict[str, Any]] = []
+current_reference_width: Optional[int] = None
+current_reference_height: Optional[int] = None
+composite_drag_data = {
+    "x": 0, "y": 0, "item": None, "element_data": None,
+    "start_original_x": 0.0, "start_original_y": 0.0,
+    "initial_game_offset_x_at_drag_start": 0.0,
+    "initial_game_offset_y_at_drag_start": 0.0
+}
+composite_zoom_level = 1.0
+composite_pan_offset_x = 0.0
+composite_pan_offset_y = 0.0
+
+DEFAULT_TEXT_FONT_FAMILY = "Arial"
+DEFAULT_TEXT_BASE_FONT_SIZE = 14
+DEFAULT_TEXT_COLOR_FALLBACK = "white"
+
+# New structure: (tag, text, gui_x, gui_y, design_font_size, font_size_offset_label, color_label, is_fixed, x_offset_label, base_game_x, y_offset_label, base_game_y)
+initial_text_elements_config = [
+    ("text_hom", "HOM", 185, 22, 24, "Home Team Name Size", "Home Team Name Color", # design_font_size is GUI-scaled
+     False, "Home Team Name X", 241, "Home Team Name Y", 17),
+    ("text_awa", "AWA", 375, 22, 24, "Away Team Name Size", "Away Team Name Color",
+     False, "Away Team Name X", 425, "Away Team Name Y", 17),
+    ("text_score1", "1", 280, 22, 24, "Home Score Size", "Home Score Color",
+     False, "Home Score X", 352, "Home Score Y", 17),
+    ("text_score2", "2", 325, 22, 24, "Away Score Size", "Away Score Color",
+     False, "Away Score X", 395, "Away Score Y", 17),
+    ("text_time_min1",  "1", 70, 23, 20, "Time Text Size", "Time Text Color",
+     False, "1st Digit of Time (0--:--) X", -330, "1st Digit of Time (0--:--) Y", 2),
+    ("text_time_min2",  "0", 85, 23, 20, "Time Text Size", "Time Text Color",
+     False, "2nd Digit of Time (-0-:--) X", -315, "2nd Digit of Time (-0-:--) Y", 2),
+    ("text_time_min3",  "5", 100, 23, 20, "Time Text Size", "Time Text Color",
+     False, "3rd Digit of Time (--0:--) X", -300, "3rd Digit of Time (--0:--) Y", 2),
+    ("text_time_colon", ":", 116, 20, 20, "Time Text Size", "Time Text Color",
+     False, "Colon Seperator of Time (---:--) X", -290, "Colon Seperator of Time (---:--) Y", -2),
+    ("text_time_sec1",  "3", 125, 23, 20, "Time Text Size", "Time Text Color",
+     False, "4th Digit of Time (---:0-) X", -280, "4th Digit of Time (---:0-) Y", 2),
+    ("text_time_sec2",  "8", 140, 23, 20, "Time Text Size", "Time Text Color",
+     False, "5th Digit of Time (---:-0) X", -265, "5th Digit of Time (---:-0) Y", 2),
+    ("text_added_time", "+9", 120, 67, 22, "PlaceHolder", None, # design_font_size 22, no specific game offset link
+     False, "Added Time X", 130, "Added Time Y", 83),
+]
+
+predefined_image_coords: Dict[str, tuple[float, float, Optional[str], Optional[float], Optional[str], Optional[float]]] = {
+    "img_10":       (5.0, 5.0, None, None, None, None),
+    "img_14":       (104, 51, None, None, None, None),
+    "img_30_orig":  (135, 8, "Home Color Bar X", 212, "Home Color Bar Y", 103.5),
+    "img_30_dup":   (436, 8, "Away Color Bar X", 502, "Away Color Bar Y", 103.5)
+}
+
+highlighted_offset_entries = []
+
+
+class EditAction:
+    def __init__(self, string_var, old_value, new_value, key_tuple, entry_widget_ref, description="value change"):
+        self.string_var = string_var
+        self.old_value = old_value
+        self.new_value = new_value
+        self.key_tuple = key_tuple
+        self.entry_widget_ref = entry_widget_ref
+        self.description = description
+
+    def undo(self): self.string_var.set(self.old_value)
+    def redo(self): self.string_var.set(self.new_value)
+    def __str__(self): return f"EditAction({self.description}: {self.old_value} -> {self.new_value})"
+
+class UndoManager:
+    def __init__(self, max_history=50):
+        self.undo_stack: List[EditAction] = []
+        self.redo_stack: List[EditAction] = []
+        self.max_history = max_history
+
+    def record_action(self, action: EditAction):
+        self.redo_stack.clear()
+        self.undo_stack.append(action)
+        if len(self.undo_stack) > self.max_history:
+            self.undo_stack.pop(0)
+        self.update_menu_states()
+        logging.debug(f"Recorded action: {action}")
+
+    def can_undo(self): return bool(self.undo_stack)
+    def can_redo(self): return bool(self.redo_stack)
+
+    def _apply_action_and_update_ui(self, action_to_apply: EditAction, is_undo: bool):
+        logging.debug(f"Applying {'undo' if is_undo else 'redo'} for: {action_to_apply}")
+        if is_undo:
+            action_to_apply.undo()
+        else:
+            action_to_apply.redo()
+        is_offset_var = False
+        if hasattr(root, 'offsets_vars'):
+            for key, var in root.offsets_vars.items():
+                if var == action_to_apply.string_var:
+                    update_value(key, action_to_apply.string_var, from_undo_redo=True)
+                    is_offset_var = True
+                    break
+        if not is_offset_var and hasattr(root, 'color_vars'):
+            for key, var in root.color_vars.items():
+                if var == action_to_apply.string_var:
+                    update_color_preview_from_entry(key, action_to_apply.string_var, from_undo_redo=True)
+                    break
+        if action_to_apply.entry_widget_ref and isinstance(action_to_apply.entry_widget_ref, tk.Entry):
+            try:
+                action_to_apply.entry_widget_ref.focus_set()
+                action_to_apply.entry_widget_ref.selection_range(0, tk.END)
+            except tk.TclError:
+                logging.debug("TclError focusing widget during undo/redo.")
+        self.update_menu_states()
+
+    def undo(self):
+        if not self.can_undo(): return
+        action = self.undo_stack.pop()
+        self._apply_action_and_update_ui(action, is_undo=True)
+        self.redo_stack.append(action)
+        self.update_menu_states()
+        logging.info(f"Undone: {action}")
+
+    def redo(self):
+        if not self.can_redo(): return
+        action = self.redo_stack.pop()
+        self._apply_action_and_update_ui(action, is_undo=False)
+        self.undo_stack.append(action)
+        self.update_menu_states()
+        logging.info(f"Redone: {action}")
+
+    def clear_history(self):
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.update_menu_states()
+        logging.info("Undo/Redo history cleared.")
+
+    def update_menu_states(self):
+        if hasattr(root, 'editmenu'):
+            root.editmenu.entryconfig("Undo", state=tk.NORMAL if self.can_undo() else tk.DISABLED)
+            root.editmenu.entryconfig("Redo", state=tk.NORMAL if self.can_redo() else tk.DISABLED)
+
+undo_manager = UndoManager()
+
+class Compression(Enum): NONE = "None"; EAHD = "EAHD"
 
 @dataclass
 class FileEntry:
-    offset: int         # Offset of the raw data in the BIG file
-    size: int           # Decompressed size of the data
-    name: str
-    file_type: str      # e.g., DDS, APT, DAT
-    compression: Compression
-    data: bytes         # Decompressed data
-    raw_size: int       # Size of the raw (possibly compressed) data in the BIG file
+    offset: int; size: int; name: str; file_type: str
+    compression: Compression; data: bytes; raw_size: int
 
 class BinaryReader:
-    def __init__(self, data: bytearray):
-        self.data = data
-        self.pos = 0
-
+    def __init__(self, data: bytearray): self.data = data; self.pos = 0
     def read_byte(self) -> int:
-        if self.pos >= len(self.data):
-            raise ValueError("End of stream reached")
-        value = self.data[self.pos]
-        self.pos += 1
-        return value
-
-    def read_int(self, bytes_count: int = 4, big_endian: bool = False) -> int:
-        if self.pos + bytes_count > len(self.data):
-            raise ValueError(f"Not enough data to read {bytes_count} bytes for int.")
-        chunk = self.data[self.pos:self.pos + bytes_count]
-        self.pos += bytes_count
-        return int.from_bytes(chunk, "big" if big_endian else "little")
-
-    def read_string(self, encoding: str) -> str:
-        start = self.pos
-        while self.pos < len(self.data) and self.data[self.pos] != 0:
-            self.pos += 1
-        if self.pos >= len(self.data) and (self.pos == start or self.data[self.pos-1] != 0) : # check if null terminator was even found
-             # Handle case where string is not null-terminated or end of data is reached
-             result = self.data[start:self.pos].decode(encoding, errors="ignore")
-             # No self.pos += 1 because no null terminator to skip
-        else:
-            result = self.data[start:self.pos].decode(encoding, errors="ignore")
-            self.pos += 1  # Skip null terminator
-        return result
-
-    def skip(self, count: int):
-        if self.pos + count > len(self.data):
-            # logging.warning(f"Attempted to skip {count} bytes beyond data length.")
-            self.pos = len(self.data) # Go to end
-        else:
-            self.pos += count
+        if self.pos >= len(self.data): raise ValueError("EOS byte")
+        v = self.data[self.pos]; self.pos += 1; return v
+    def read_int(self, c: int = 4, be: bool = False) -> int:
+        if self.pos + c > len(self.data): raise ValueError(f"EOS int{c}")
+        chunk = self.data[self.pos:self.pos+c]; self.pos += c
+        return int.from_bytes(chunk, "big" if be else "little")
+    def read_string(self, enc: str) -> str:
+        s = self.pos
+        while self.pos < len(self.data) and self.data[self.pos] != 0: self.pos += 1
+        b = self.data[s:self.pos]
+        if self.pos < len(self.data) and self.data[self.pos] == 0: self.pos += 1
+        return b.decode(enc, errors="ignore")
+    def skip(self, c: int): self.pos = min(len(self.data), self.pos + c)
 
 class Decompressor:
     @staticmethod
     def detect_compression(data: bytes) -> Compression:
         return Compression.EAHD if len(data) >= 2 and data[:2] == b"\xfb\x10" else Compression.NONE
-
     @staticmethod
     def decompress_eahd(data: bytes) -> bytes:
         try:
-            reader = BinaryReader(bytearray(data))
-            if reader.read_int(2, True) != 0xFB10: # Check EAHD magic
-                return data # Not EAHD or malformed, return as is
-
-            total_size = reader.read_int(3, True)
-            output = bytearray(total_size)
-            pos = 0
-
-            while reader.pos < len(reader.data) and pos < total_size:
-                ctrl = reader.read_byte()
-
-                to_read = 0
-                to_copy = 0
-                offset_val = 0 # Renamed from 'offset' to avoid conflict
-
-                if ctrl < 0x80:  # Short copy
-                    a = reader.read_byte()
-                    to_read = ctrl & 0x03
-                    to_copy = ((ctrl & 0x1C) >> 2) + 3
-                    offset_val = ((ctrl & 0x60) << 3) + a + 1
-                elif ctrl < 0xC0:  # Medium copy
-                    a, b = reader.read_byte(), reader.read_byte()
-                    to_read = (a >> 6) & 0x03
-                    to_copy = (ctrl & 0x3F) + 4
-                    offset_val = ((a & 0x3F) << 8) + b + 1
-                elif ctrl < 0xE0:  # Long copy
-                    a, b, c = reader.read_byte(), reader.read_byte(), reader.read_byte()
-                    to_read = ctrl & 0x03
-                    to_copy = ((ctrl & 0x0C) << 6) + c + 5
-                    offset_val = ((ctrl & 0x10) << 12) + (a << 8) + b + 1
-                elif ctrl < 0xFC:  # Large read
-                    to_read = ((ctrl & 0x1F) << 2) + 4
-                else:  # Small read
-                    to_read = ctrl & 0x03
-                
-                if pos + to_read > total_size: # Boundary check
-                    to_read = total_size - pos
+            r = BinaryReader(bytearray(data))
+            if r.read_int(2, True) != 0xFB10: return data
+            total_size = r.read_int(3, True); out = bytearray(total_size); pos = 0
+            while r.pos < len(r.data) and pos < total_size:
+                ctrl = r.read_byte(); to_read = 0; to_copy = 0; off_val = 0
+                if ctrl < 0x80:
+                    a = r.read_byte(); to_read = ctrl & 0x03
+                    to_copy = ((ctrl & 0x1C) >> 2)+3; off_val = ((ctrl & 0x60) << 3)+a+1
+                elif ctrl < 0xC0:
+                    a,b = r.read_byte(),r.read_byte(); to_read = (a >> 6)&0x03
+                    to_copy = (ctrl&0x3F)+4; off_val = ((a&0x3F)<<8)+b+1
+                elif ctrl < 0xE0:
+                    a,b,c = r.read_byte(),r.read_byte(),r.read_byte(); to_read = ctrl&0x03
+                    to_copy = ((ctrl&0x0C)<<6)+c+5; off_val = ((ctrl&0x10)<<12)+(a<<8)+b+1
+                elif ctrl < 0xFC: to_read = ((ctrl&0x1F)<<2)+4
+                else: to_read = ctrl&0x03
+                if pos+to_read > total_size: to_read = total_size-pos
                 for _ in range(to_read):
-                    output[pos] = reader.read_byte()
-                    pos += 1
-                
+                    if r.pos>=len(r.data): break
+                    out[pos]=r.read_byte(); pos+=1
                 if to_copy > 0:
-                    copy_start = pos - offset_val
-                    if copy_start < 0: # Invalid offset
-                        logging.error("EAHD Decompression: Invalid copy offset.")
-                        return data # Error condition
-                    
-                    if pos + to_copy > total_size: # Boundary check
-                        to_copy = total_size - pos
+                    c_start = pos-off_val
+                    if c_start < 0: logging.error("EAHD: Invalid copy offset."); return data
+                    if pos+to_copy > total_size: to_copy = total_size-pos
                     for _ in range(to_copy):
-                        if copy_start >= pos: # Should not happen with valid EAHD
-                            logging.error("EAHD Decompression: copy_start >= pos.")
-                            return data
-                        output[pos] = output[copy_start]
-                        pos += 1
-                        copy_start += 1
-            
-            return bytes(output[:pos]) # Return only the written part
-        except ValueError as e: # Catch BinaryReader EoS errors
-            logging.error(f"ERROR: EAHD decompression failed (ValueError) - {e}")
-            return data # Return original on error
-        except Exception as e:
-            logging.error(f"ERROR: EAHD decompression failed (General Exception) - {e}")
-            return data
+                        if c_start >= pos: logging.error("EAHD: copy_start >= pos."); return data
+                        out[pos]=out[c_start]; pos+=1; c_start+=1
+            return bytes(out[:pos])
+        except ValueError as e: logging.error(f"EAHD Decomp ValueError: {e}"); return data
+        except Exception as e: logging.error(f"EAHD Decomp Exception: {e}", exc_info=True); return data
 
 class Compressor:
     @staticmethod
     def compress_eahd(data: bytes) -> bytes:
-        """
-        Compress data using EAHD algorithm.
-        Placeholder: This function should implement EAHD compression.
-        Currently, it returns the data uncompressed with a warning.
-        """
-        logging.warning("EAHD COMPRESSION IS NOT IMPLEMENTED. Returning uncompressed data.")
-        # A real implementation would go here.
-        # For now, we simulate by returning original data.
-        # If you had a real compressor, it might also return None or raise on error.
-        
-        # To make it slightly more realistic for testing import logic,
-        # let's pretend it compresses and adds the header if it were successful.
-        # This is NOT real compression.
-        # header = b"\xfb\x10" # EAHD magic
-        # size_bytes = len(data).to_bytes(3, 'big')
-        # return header + size_bytes + data # This is a FAKE compressed structure for testing size logic
-        return data # Keep it simple: return uncompressed until real one is available
+        logging.warning("EAHD COMPRESSION IS NOT IMPLEMENTED. Ret uncompressed.")
+        return data
 
 class FifaBigFile:
     def __init__(self, filename):
-        self.filename = filename
-        self.entries: List[FileEntry] = []
-        self._load()
-
+        self.filename = filename; self.entries: List[FileEntry] = []; self._load()
     def _load(self):
         try:
-            with open(self.filename, 'rb') as f:
-                self.data_content = bytearray(f.read()) # Store raw content of the .big file
-        except FileNotFoundError:
-            logging.error(f"BIG file not found: {self.filename}")
-            raise
-        
-        reader = BinaryReader(self.data_content)
+            with open(self.filename, 'rb') as f: self.data_content = bytearray(f.read())
+        except FileNotFoundError: logging.error(f"BIG file not found: {self.filename}"); raise
+        r = BinaryReader(self.data_content)
         try:
             magic = bytes(self.data_content[:4])
-            if magic not in (b'BIGF', b'BIG4'):
-                raise ValueError(f"Invalid BIG file magic: {magic}")
-            reader.skip(4)  # Skip magic
-
-            total_data_size_in_header = reader.read_int(4, False) # Little Endian
-            num_entries = reader.read_int(4, True) # Big Endian
-            header_block_size = reader.read_int(4, True) # Big Endian (often the offset of the first file)
-        except ValueError as e:
-            logging.error(f"Error reading BIG file header: {e}")
-            raise
-
-        current_type_tag = "DAT" # Default type tag
-        for _ in range(num_entries):
+            if magic not in (b'BIGF',b'BIG4'): raise ValueError(f"Invalid BIG magic: {magic}")
+            r.skip(4); r.read_int(4,False); num_entries = r.read_int(4,True); r.read_int(4,True)
+        except ValueError as e: logging.error(f"BIG header error: {e}"); raise
+        c_type_tag = "DAT"
+        for i in range(num_entries):
             try:
-                entry_offset = reader.read_int(4, True) # Big Endian
-                entry_raw_size = reader.read_int(4, True) # Big Endian
-                entry_name = reader.read_string('utf-8')
-            except ValueError as e:
-                logging.error(f"Error reading entry in BIG file: {e}")
-                continue # Skip malformed entry
-
-            if entry_raw_size == 0 and entry_name in {"sg1", "sg2"}:
-                current_type_tag = {"sg1": "DDS", "sg2": "APT"}[entry_name]
-                self.entries.append(FileEntry(entry_offset, 0, entry_name, current_type_tag, Compression.NONE, b"", 0))
+                entry_offset = r.read_int(4,True); entry_raw_size = r.read_int(4,True)
+                entry_name = r.read_string('utf-8')
+            except ValueError as e: logging.error(f"Entry read error {i}: {e}"); continue
+            if entry_raw_size == 0 and entry_name in {"sg1","sg2"}:
+                c_type_tag = {"sg1":"DDS","sg2":"APT"}[entry_name]
+                self.entries.append(FileEntry(entry_offset,0,entry_name,c_type_tag,Compression.NONE,b"",0))
                 continue
+            actual_raw_size = entry_raw_size
+            if entry_offset+entry_raw_size > len(self.data_content):
+                actual_raw_size = len(self.data_content)-entry_offset
+                if actual_raw_size < 0: actual_raw_size = 0
+            raw_data = bytes(self.data_content[entry_offset : entry_offset+actual_raw_size])
+            comp_type = Decompressor.detect_compression(raw_data)
+            decomp_data = Decompressor.decompress_eahd(raw_data) if comp_type == Compression.EAHD else raw_data
+            det_file_type = c_type_tag
+            if decomp_data[:4] == b'DDS ': det_file_type = "DDS"
+            self.entries.append(FileEntry(entry_offset,len(decomp_data),entry_name,det_file_type,comp_type,decomp_data,entry_raw_size))
+    def list_files(self) -> List[str]: return [e.name for e in self.entries if e.size > 0]
 
-            # Boundary check for raw_data read
-            if entry_offset + entry_raw_size > len(self.data_content):
-                logging.warning(f"Entry '{entry_name}' raw data extends beyond EOF. Clamping size.")
-                clamped_raw_size = len(self.data_content) - entry_offset
-                if clamped_raw_size < 0: clamped_raw_size = 0 # Should not happen if offset is valid
-                raw_data = bytes(self.data_content[entry_offset : entry_offset + clamped_raw_size])
-            else:
-                raw_data = bytes(self.data_content[entry_offset : entry_offset + entry_raw_size])
+def format_filesize(b: int) -> str:
+    if b < 1024: return f"{b} bytes"
+    return f"{b/1024:.2f} KB" if b < 1024*1024 else f"{b/(1024*1024):.2f} MB"
 
-            compression_type = Decompressor.detect_compression(raw_data)
-            decompressed_data = Decompressor.decompress_eahd(raw_data) if compression_type == Compression.EAHD else raw_data
-            
-            # file_type determination could be more sophisticated here if needed
-            # For now, it's based on current_type_tag or could inspect decompressed_data magic
-            determined_file_type = current_type_tag 
-            if decompressed_data[:4] == b'DDS ':
-                determined_file_type = "DDS"
-            # Add more type detections if necessary
-
-            self.entries.append(FileEntry(offset=entry_offset, 
-                                           size=len(decompressed_data), 
-                                           name=entry_name, 
-                                           file_type=determined_file_type, 
-                                           compression=compression_type, 
-                                           data=decompressed_data,
-                                           raw_size=entry_raw_size)) # Store raw_size
-
-    def list_files(self) -> List[str]: # Type hint for return
-        return [entry.name for entry in self.entries if entry.size > 0]
-
-    # detect_file_type and export_file methods are not used by the main GUI flow,
-    # export_selected_file handles exports. These could be removed if truly unused.
-    # For now, keeping them as they might be utility.
-
-def read_internal_name(file_path_to_read: str) -> str | None: # Python 3.10+ union type
-    if not file_path_to_read or not os.path.exists(file_path_to_read):
-        return None
+def read_internal_name(fp: str) -> Optional[str]:
+    if not fp or not os.path.exists(fp): return None
     try:
-        with open(file_path_to_read, 'rb') as file:
-            file_content = file.read()
-            # Optimization: Search for numbers directly in bytes if possible,
-            # or decode smaller chunks if file is huge.
-            # For typical BIG files, full decode is okay.
-            decoded_text = file_content.decode('utf-8', errors='ignore')
-            
-            possible_internal_names = ["15002", "2002", "3002", "4002", "5002", "6002", "8002"]
-
-            for internal_name_str in possible_internal_names:
-                if internal_name_str in decoded_text:
-                    return internal_name_str
-            return None
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to read internal name: {e}")
-        logging.error(f"Failed to read internal name from {file_path_to_read}: {e}")
+        with open(fp, 'rb') as f: content = f.read(200*1024)
+        text = content.decode('utf-8', errors='ignore')
+        names = ["15002", "2002", "3002", "4002", "5002", "6002", "8002"]
+        for n in names:
+            if n in text: return n
         return None
+    except Exception as e: logging.error(f"Read internal name fail: {e}"); return None
 
 def open_file():
-    global file_path, current_image, current_image_index
-    file_path_temp = filedialog.askopenfilename(filetypes=[("FIFA Big Files", "*.big")])
-    
-    if file_path_temp:
-        file_path = file_path_temp
-        current_image_index = 0
-        update_status(f"File Loaded: {os.path.basename(file_path)}", "blue")
-        add_internal_name() # This handles UI updates and first texture display
-
-        if not internal_name_label.cget("text").startswith("Internal Name: Not Loaded"):
-            # Preview reset is largely handled by extract_and_display_texture
-            # but ensure a clean state if internal name processing was successful.
-            preview_canvas.delete("all")
-            current_image = None # Reset PIL image store
-            texture_label.config(text="")
-            image_dimensions_label.config(text="")
-            extract_and_display_texture() # Display first texture of the new file
+    global file_path, current_image_index, composite_mode_active, undo_manager
+    global original_loaded_offsets, original_loaded_colors
+    fp_temp = filedialog.askopenfilename(filetypes=[("FIFA Big Files", "*.big")])
+    if fp_temp:
+        file_path = fp_temp; current_image_index = 0
+        undo_manager.clear_history(); original_loaded_offsets.clear(); original_loaded_colors.clear()
+        if hasattr(root, 'asterisk_labels'):
+            for al in root.asterisk_labels.values(): al.config(text="")
+        file_path_label.config(text=f"File: {os.path.basename(file_path)}")
+        add_internal_name()
+        is_ok = internal_name_label.cget("text").startswith("Internal Name: ") and \
+                not internal_name_label.cget("text").endswith("(No Config)") and \
+                not internal_name_label.cget("text").endswith("(Detection Failed)")
+        if composite_mode_active:
+            is_comp_elig = (file_path and 0<=current_image_index<len(image_files) and image_files[current_image_index]=="10")
+            if not is_comp_elig or not is_ok: toggle_composite_mode()
+            else: display_composite_view()
         else:
-            # If internal name failed, clear preview as well
-            preview_canvas.delete("all")
-            current_image = None
-            texture_label.config(text="Load a .big file")
-            image_dimensions_label.config(text="")
-
-
-current_image_index = 0
-image_files = [str(i) for i in range(1, 81)] # Texture names "1" through "80"
-
-def extract_and_display_texture() -> bool: # Return bool for success/failure
-    global file_path, preview_canvas, current_image, current_image_index, image_dimensions_label, preview_bg_color_is_white
-
-    if not file_path:
-        preview_canvas.delete("all") # Clear canvas if no file
-        texture_label.config(text="No file loaded")
-        image_dimensions_label.config(text="")
-        current_image = None
-        return False
-
-    try:
-        # Re-read the BIG file content for the texture
-        # This is somewhat inefficient if FifaBigFile instance could be cached,
-        # but ensures fresh data if file was externally modified (unlikely during app use)
-        # or if import modified it.
-        big_file_obj = FifaBigFile(file_path) # This re-parses the whole BIG file
-
-        if not image_files or not (0 <= current_image_index < len(image_files)):
-            logging.warning("Invalid image index or image_files list empty.")
-            return False
-            
-        image_file_to_find = image_files[current_image_index]
-        
-        found_entry = None
-        for entry in big_file_obj.entries:
-            if entry.name == image_file_to_find:
-                found_entry = entry
-                break
-        
-        if not found_entry:
-            preview_canvas.delete("all")
-            texture_label.config(text=f"{image_file_to_find}.dds (Not Found)")
-            image_dimensions_label.config(text="")
-            current_image = None
-            return False
-
-        if found_entry.size == 0 or not found_entry.data: # No data to display
-            preview_canvas.delete("all")
-            texture_label.config(text=f"{image_file_to_find}.dds (No Data)")
-            image_dimensions_label.config(text="")
-            current_image = None
-            return False
-
-        dds_data = found_entry.data
-        
-        if len(dds_data) < 128 or dds_data[:4] != b'DDS ': # Basic DDS validation
-            preview_canvas.delete("all")
-            texture_label.config(text=f"{image_file_to_find}.dds (Invalid DDS)")
-            image_dimensions_label.config(text="")
-            current_image = None
-            return False
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_dds_file:
-            temp_dds_path = temp_dds_file.name
-            temp_dds_file.write(dds_data)
-
-        try:
-            pil_image = Image.open(temp_dds_path)
-            original_width, original_height = pil_image.width, pil_image.height
-            
-            bg_color_tuple = (255, 255, 255, 255) if preview_bg_color_is_white else (0, 0, 0, 255)
-
-            pil_image_rgba = pil_image.convert('RGBA') if pil_image.mode != 'RGBA' else pil_image
-            
-            background = Image.new('RGBA', pil_image_rgba.size, bg_color_tuple)
-            combined_pil_image = Image.alpha_composite(background, pil_image_rgba)
-            
-            current_image = combined_pil_image.copy() # Store this for zoom/pan (already composited)
-
-            # Scale image to fit canvas while maintaining aspect ratio
-            canvas_width = preview_canvas.winfo_width()
-            canvas_height = preview_canvas.winfo_height()
-            if canvas_width <= 1 or canvas_height <= 1: # Canvas not ready
-                canvas_width, canvas_height = 580, 150 # Fallback to default if not drawn
-
-            img_display_width, img_display_height = combined_pil_image.width, combined_pil_image.height
-            
-            ratio = min(canvas_width / img_display_width, canvas_height / img_display_height)
-            if ratio < 1.0: # Only downscale, don't upscale
-                display_width_final = int(img_display_width * ratio)
-                display_height_final = int(img_display_height * ratio)
-                display_image_tk = combined_pil_image.resize((display_width_final, display_height_final), Image.LANCZOS)
+            if is_ok: extract_and_display_texture()
             else:
-                display_image_tk = combined_pil_image # Use as is if it fits or is smaller
-            
-            img_tk = ImageTk.PhotoImage(display_image_tk)
+                preview_canvas.delete("all"); current_image = None
+                texture_label.config(text="Load .big / Invalid internal name"); image_dimensions_label.config(text="")
+    elif not file_path: file_path_label.config(text="File: None")
 
-            preview_canvas.delete("all")
-            # Draw image centered on canvas
-            preview_canvas.create_image(canvas_width // 2, canvas_height // 2, anchor=tk.CENTER, image=img_tk, tags="image_on_canvas")
-            preview_canvas.image_ref = img_tk # Keep reference
-            
-            texture_label.config(text=f"{image_file_to_find}.dds")
-            image_dimensions_label.config(text=f"{original_width}x{original_height}")
-            global zoom_level
-            zoom_level = 1.0 # Reset zoom for new image
-
-            return True
-        except Exception as e:
-            logging.error(f"Failed to process/display DDS image '{image_file_to_find}': {e}")
-            preview_canvas.delete("all")
-            texture_label.config(text=f"{image_file_to_find}.dds (Display Error)")
-            current_image = None
-            return False
-        finally:
-            if 'temp_dds_path' in locals() and os.path.exists(temp_dds_path):
-                os.remove(temp_dds_path)
-    except FileNotFoundError:
-        # This case should ideally be handled by the initial file_path check
-        logging.warning(f"extract_and_display_texture: File not found {file_path}")
-        return False
-    except ValueError as e: # Handles issues from FifaBigFile parsing
-        logging.error(f"ValueError during texture extraction (likely BIG file format issue): {e}")
-        messagebox.showerror("File Error", f"Could not parse BIG file: {e}")
-        preview_canvas.delete("all")
-        texture_label.config(text="Error parsing BIG file")
-        current_image = None
-        return False
-    except Exception as e:
-        logging.error(f"An error occurred while extracting texture: {e}", exc_info=True)
-        preview_canvas.delete("all")
-        texture_label.config(text="Error loading texture")
-        current_image = None
-        return False
-
-
-zoom_level = 1.0
-drag_data = {"x": 0, "y": 0, "item": None}
-
-def zoom_image(event):
-    global zoom_level, current_image, preview_canvas
-
-    if current_image is None: return # No base image to zoom
-
-    factor = 1.1 if event.delta > 0 else (1 / 1.1)
-    new_zoom_level = zoom_level * factor
-    new_zoom_level = max(0.1, min(new_zoom_level, 5.0)) # Clamp zoom
-
-    if abs(new_zoom_level - zoom_level) < 0.001 and new_zoom_level != 1.0 : # Avoid tiny changes if already at limit
-        if (new_zoom_level == 0.1 and factor < 1) or \
-           (new_zoom_level == 5.0 and factor > 1) :
-            return
-
-    zoom_level = new_zoom_level
-    
-    new_width = int(current_image.width * zoom_level)
-    new_height = int(current_image.height * zoom_level)
-    
-    if new_width <= 0 or new_height <= 0: return
-
+def redraw_single_view_image():
+    global current_image, preview_canvas, single_view_zoom_level, single_view_pan_offset_x, single_view_pan_offset_y
+    if current_image is None: preview_canvas.delete("all"); return
+    canvas_w=preview_canvas.winfo_width(); canvas_h=preview_canvas.winfo_height()
+    if canvas_w<=1:canvas_w=580;canvas_h=150
+    img_to_display = current_image
+    zoomed_w=int(img_to_display.width*single_view_zoom_level); zoomed_h=int(img_to_display.height*single_view_zoom_level)
+    if zoomed_w<=0 or zoomed_h<=0: return
     try:
-        # current_image is the PIL Image after alpha compositing with background
-        resized_image_pil = current_image.resize((new_width, new_height), Image.LANCZOS)
-        img_tk_zoomed = ImageTk.PhotoImage(resized_image_pil)
+        resized_img=img_to_display.resize((zoomed_w,zoomed_h),Image.LANCZOS)
+        img_tk=ImageTk.PhotoImage(resized_img); preview_canvas.delete("all")
+        draw_x=canvas_w/2+single_view_pan_offset_x; draw_y=canvas_h/2+single_view_pan_offset_y
+        preview_canvas.create_image(draw_x,draw_y,anchor=tk.CENTER,image=img_tk,tags="image_on_canvas")
+        preview_canvas.image_ref = img_tk
+    except Exception as e: logging.error(f"Error redrawing single view: {e}")
 
-        preview_canvas.delete("all") # Clear previous
-        # Center the zoomed image on the canvas
-        canvas_width = preview_canvas.winfo_width()
-        canvas_height = preview_canvas.winfo_height()
-        preview_canvas.create_image(canvas_width // 2, canvas_height // 2, anchor=tk.CENTER, image=img_tk_zoomed, tags="image_on_canvas")
-        preview_canvas.image_ref = img_tk_zoomed
-    except Exception as e:
-        logging.error(f"Error during zoom: {e}")
+def extract_and_display_texture() -> bool:
+    global file_path,current_image,current_image_index,preview_bg_color_is_white,composite_mode_active
+    global single_view_zoom_level,single_view_pan_offset_x,single_view_pan_offset_y
+    if composite_mode_active: return False
+    if not file_path:
+        preview_canvas.delete("all");texture_label.config(text="No file");current_image=None;return False
+    try:
+        big_file=FifaBigFile(file_path)
+        if not(0<=current_image_index<len(image_files)): return False
+        img_name=image_files[current_image_index]
+        entry=next((e for e in big_file.entries if e.name==img_name),None)
+        if not entry or entry.size==0 or not entry.data or entry.file_type!="DDS" or entry.data[:4]!=b'DDS ':
+            logging.info(f"Texture '{img_name}' invalid/not found."); return False
+        temp_dds_path=None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False,suffix=".dds") as tmp_f:
+                tmp_f.write(entry.data);temp_dds_path=tmp_f.name
+            pil_img=Image.open(temp_dds_path);w_orig,h_orig=pil_img.width,pil_img.height
+            bg_color=(255,255,255,255) if preview_bg_color_is_white else (0,0,0,255)
+            pil_rgba=pil_img.convert('RGBA') if pil_img.mode!='RGBA' else pil_img
+            background=Image.new('RGBA',pil_rgba.size,bg_color)
+            current_image=Image.alpha_composite(background,pil_rgba)
+            single_view_zoom_level=1.0;single_view_pan_offset_x=0.0;single_view_pan_offset_y=0.0
+            redraw_single_view_image()
+            texture_label.config(text=f"{img_name}.dds");image_dimensions_label.config(text=f"{w_orig}x{h_orig}")
+            return True
+        except Exception as e_disp: logging.warning(f"Display DDS '{img_name}' failed: {e_disp}"); return False
+        finally:
+            if temp_dds_path and os.path.exists(temp_dds_path): os.remove(temp_dds_path)
+    except Exception as e_outer: logging.error(f"Outer error in extract: {e_outer}",exc_info=True); return False
 
+def zoom_image_handler(event):
+    if composite_mode_active: zoom_composite_view(event)
+    else: zoom_single_view(event)
 
-def start_drag(event):
-    global drag_data
-    # Find the image item on the canvas using its tag
-    items = preview_canvas.find_withtag("image_on_canvas")
-    if items:
-        drag_data["item"] = items[0]
-        drag_data["x"] = event.x
-        drag_data["y"] = event.y
-    else:
-        drag_data["item"] = None
+def zoom_single_view(event):
+    global single_view_zoom_level
+    if current_image is None: return
+    factor=1.1 if event.delta>0 else (1/1.1)
+    new_zoom=max(0.05,min(single_view_zoom_level*factor,10.0))
+    single_view_zoom_level=new_zoom; redraw_single_view_image()
 
-def on_drag(event):
-    global drag_data
-    if drag_data["item"] is not None:
-        dx = event.x - drag_data["x"]
-        dy = event.y - drag_data["y"]
-        preview_canvas.move(drag_data["item"], dx, dy)
-        drag_data["x"] = event.x
-        drag_data["y"] = event.y
+def start_drag_handler(event):
+    if composite_mode_active: start_drag_composite(event)
+    else: start_drag_single(event)
+
+def on_drag_handler(event):
+    if composite_mode_active: on_drag_composite(event)
+    else: on_drag_single(event)
+
+def on_drag_release_handler(event):
+    global drag_data,composite_mode_active
+    drag_data["is_panning"]=False;drag_data["is_panning_rmb"]=False
+    if composite_mode_active: clear_all_highlights()
+
+def start_drag_single(event):
+    global drag_data; drag_data["is_panning"]=True; drag_data["x"]=event.x; drag_data["y"]=event.y
+
+def on_drag_single(event):
+    global drag_data,single_view_pan_offset_x,single_view_pan_offset_y
+    if not drag_data["is_panning"] or current_image is None: return
+    dx=event.x-drag_data["x"]; dy=event.y-drag_data["y"]
+    single_view_pan_offset_x+=dx; single_view_pan_offset_y+=dy
+    drag_data["x"]=event.x; drag_data["y"]=event.y; redraw_single_view_image()
 
 def load_current_values():
-    global file_path, previous_file_path, previous_offsets_values, previous_color_values
-    if not file_path: return
-    if not hasattr(root, 'offsets_vars') or not hasattr(root, 'color_vars'): return
-
+    global file_path,original_loaded_offsets,original_loaded_colors
+    if not file_path or not hasattr(root,'offsets_vars') or not hasattr(root,'color_vars'): return
+    original_loaded_offsets.clear(); original_loaded_colors.clear()
     try:
-        with open(file_path, 'rb') as file:
-            for offset_tuple, var_obj in root.offsets_vars.items():
-                if offset_tuple: # Should always be true if keys are valid
-                    try:
-                        file.seek(offset_tuple[0]) # Read from the first offset in list for display
-                        data_bytes = file.read(4)
-                        value_float = struct.unpack('<f', data_bytes)[0]
-                        var_obj.set(f"{value_float:.2f}") # Display with precision
-                        previous_offsets_values[offset_tuple] = var_obj.get() # Store the string representation
-                    except struct.error:
-                        logging.warning(f"Struct error reading float at offset {offset_tuple[0]}. Data: {data_bytes.hex()}")
-                        var_obj.set("ERR")
-                    except Exception as e:
-                        logging.error(f"Error reading offset {offset_tuple}: {e}")
-                        var_obj.set("ERR")
-            
-            for offset_tuple, var_obj in root.color_vars.items():
-                if offset_tuple:
-                    try:
-                        file.seek(offset_tuple[0])
-                        data_bytes = file.read(4) # Expect BGRA
-                        # Convert BGR to #RRGGBB hex for display
-                        color_code_hex = f'#{data_bytes[2]:02X}{data_bytes[1]:02X}{data_bytes[0]:02X}'
-                        var_obj.set(color_code_hex)
-                        if offset_tuple in root.color_previews:
-                             root.color_previews[offset_tuple].config(bg=color_code_hex)
-                        previous_color_values[offset_tuple] = color_code_hex
-                    except struct.error:
-                        logging.warning(f"Struct error reading color at offset {offset_tuple[0]}. Data: {data_bytes.hex()}")
-                        var_obj.set("#ERR")
-                    except Exception as e:
-                        logging.error(f"Error reading color offset {offset_tuple}: {e}")
-                        var_obj.set("#ERR")
-    except FileNotFoundError:
-        messagebox.showerror("Error", f"File not found: {file_path}")
-        logging.error(f"File not found during load_current_values: {file_path}")
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to read values from file: {e}")
-        logging.error(f"Failed to read values from {file_path}: {e}")
-
+        with open(file_path,'rb') as file:
+            for off_tuple,var_obj in root.offsets_vars.items():
+                if not off_tuple: continue
+                try:
+                    file.seek(off_tuple[0]);data=file.read(4);val=struct.unpack('<f',data)[0]
+                    val_str=f"{val:.2f}";var_obj.set(val_str);original_loaded_offsets[off_tuple]=val_str
+                    if off_tuple in root.asterisk_labels: root.asterisk_labels[off_tuple].config(text="")
+                except Exception: var_obj.set("ERR")
+            for off_tuple,var_obj in root.color_vars.items():
+                if not off_tuple: continue
+                try:
+                    file.seek(off_tuple[0]);data=file.read(4)
+                    hex_col=f'#{data[2]:02X}{data[1]:02X}{data[0]:02X}'
+                    var_obj.set(hex_col);original_loaded_colors[off_tuple]=hex_col
+                    if off_tuple in root.color_previews: root.color_previews[off_tuple].config(bg=hex_col)
+                    if off_tuple in root.asterisk_labels: root.asterisk_labels[off_tuple].config(text="")
+                except Exception: var_obj.set("#ERR")
+    except Exception as e: messagebox.showerror("Error",f"Failed to read values: {e}")
 
 def add_internal_name():
-    global file_path, previous_file_path, previous_offsets_values, previous_color_values, offsets, colors
+    global file_path,previous_file_path,offsets,colors,current_reference_width,current_reference_height,composite_mode_active
     if not file_path:
-        internal_name_label.config(text="Internal Name: Not Loaded")
-        clear_editor_widgets()
-        return
-
+        internal_name_label.config(text="Internal Name: Not Loaded");clear_editor_widgets()
+        current_reference_width=None;current_reference_height=None
+        if composite_mode_active: toggle_composite_mode(); return
     internal_name_str = read_internal_name(file_path)
     if internal_name_str:
         internal_name_label.config(text=f"Internal Name: {internal_name_str}")
-        
         if internal_name_str in offsets_data:
-            offsets_config = offsets_data[internal_name_str].get("offsets", {})
-            colors_config = offsets_data[internal_name_str].get("colors", {})
-            
-            # Preserve JSON order for offsets and colors by directly using items()
-            offsets = {k: [int(v_hex, 16) for v_hex in (v_list if isinstance(v_list, list) else [v_list])] 
-                       for k, v_list in offsets_config.items()}
-            colors = {k: [int(v_hex, 16) for v_hex in (v_list if isinstance(v_list, list) else [v_list])] 
-                      for k, v_list in colors_config.items()}
-            
-            recreate_widgets() # Defines root.offsets_vars, root.color_vars etc.
-            load_current_values()
-
-            previous_file_path = file_path
-            previous_offsets_values = {k: v.get() for k, v in root.offsets_vars.items()}
-            previous_color_values = {k: v.get() for k, v in root.color_vars.items()}
-            # extract_and_display_texture() # Called after open_file finishes this chain
-
+            config=offsets_data[internal_name_str]
+            current_reference_width=config.get("reference_width");current_reference_height=config.get("reference_height")
+            offsets={k:[int(str(v),16) for v in (vl if isinstance(vl,list) else [vl])] for k,vl in config.get("offsets",{}).items()}
+            colors={k:[int(str(v),16) for v in (vl if isinstance(vl,list) else [vl])] for k,vl in config.get("colors",{}).items()}
+            recreate_widgets();load_current_values();previous_file_path=file_path
         else:
-            messagebox.showerror("Config Error", f"Offsets for internal name '{internal_name_str}' not found in offsets.json.")
+            messagebox.showerror("Config Error",f"Config for '{internal_name_str}' not found.")
             internal_name_label.config(text=f"Internal Name: {internal_name_str} (No Config)")
-            clear_editor_widgets()
-            # extract_and_display_texture() # Still try to show texture even if no offsets
+            clear_editor_widgets();current_reference_width=None;current_reference_height=None
+            if composite_mode_active: toggle_composite_mode()
     else:
-        messagebox.showerror("Detection Error", "No internal name detected. Try another file or check offsets.json.")
-        if previous_file_path:
-            # Attempt to revert to the last valid state
-            file_path = previous_file_path # Revert file_path global
-            add_internal_name() # Recursively call to reload previous config
-            update_status(f"Reverted to: {os.path.basename(file_path)}", "orange")
+        messagebox.showerror("Detection Error","No internal name detected.")
+        current_reference_width=None;current_reference_height=None
+        if previous_file_path and previous_file_path!=file_path:
+            file_path=previous_file_path;add_internal_name()
+            update_status(f"Reverted to: {os.path.basename(file_path)}","orange")
         else:
-            update_status("No valid file to revert to.", "red")
-            internal_name_label.config(text="Internal Name: Detection Failed")
-            clear_editor_widgets()
-            preview_canvas.delete("all")
-            current_image = None
-            texture_label.config(text="")
+            internal_name_label.config(text="Internal Name: Detection Failed");clear_editor_widgets()
+            preview_canvas.delete("all");current_image=None;texture_label.config(text="")
             image_dimensions_label.config(text="")
+            if composite_mode_active: toggle_composite_mode()
 
 def clear_editor_widgets():
-    for frame in [positions_frame, sizes_frame, colors_frame]:
-        for widget in frame.winfo_children():
-            widget.destroy()
-    # Clear root-level stores for these widgets
-    for attr_name in ['offsets_vars', 'offsets_values', 'color_vars', 'color_values', 'color_previews']:
-        if hasattr(root, attr_name):
-            getattr(root, attr_name).clear() # Clear the dictionaries
+    for frame in [positions_frame,sizes_frame,colors_frame]:
+        for widget in frame.winfo_children(): widget.destroy()
+    for attr in ['offsets_vars','color_vars','color_previews','offset_entry_widgets','asterisk_labels']:
+        if hasattr(root,attr): getattr(root,attr).clear()
 
 def recreate_widgets():
-    clear_editor_widgets() # Clear existing before recreating
+    clear_editor_widgets()
+    global offsets,colors
+    root.offsets_vars={tuple(v):tk.StringVar() for v in offsets.values()}
+    root.color_vars={tuple(v):tk.StringVar(value='#000000') for v in colors.values()}
+    root.color_previews={};root.offset_entry_widgets={};root.asterisk_labels={}
 
-    global offsets, colors # These module globals are set by add_internal_name
+    def make_offset_update_lambda(key_tuple,var,entry_widget):
+        def on_offset_update(event=None):
+            old_value=original_loaded_offsets.get(key_tuple,"")
+            new_value=var.get()
+            is_focus_out_after_key_release=(event and event.type==tk.EventType.FocusOut and
+                                          hasattr(entry_widget,'_undo_recorded_for_this_change') and
+                                          entry_widget._undo_recorded_for_this_change)
+            if old_value!=new_value and not is_focus_out_after_key_release:
+                if not (event and event.type==tk.EventType.FocusOut):
+                    action=EditAction(var,old_value,new_value,key_tuple,entry_widget,f"Offset change for {key_tuple}")
+                    undo_manager.record_action(action)
+                if event and event.type==tk.EventType.KeyRelease:
+                    entry_widget._undo_recorded_for_this_change=True
+            update_value(key_tuple,var)
+            if event and event.type==tk.EventType.FocusOut:
+                if hasattr(entry_widget,'_undo_recorded_for_this_change'):
+                    delattr(entry_widget,'_undo_recorded_for_this_change')
+        return on_offset_update
 
-    # Initialize dictionaries on root for widget variables and their values
-    # Use tuple(original_list_from_json) as key to preserve order from JSON for lookups
-    root.offsets_vars = {tuple(v_list): tk.StringVar() for v_list in offsets.values()}
-    root.offsets_values = {tuple(v_list): "0.0" for v_list in offsets.values()}
-    root.color_vars = {tuple(v_list): tk.StringVar(value='#000000') for v_list in colors.values()}
-    root.color_values = {tuple(v_list): "#000000" for v_list in colors.values()}
-    root.color_previews = {}
+    def make_increment_lambda(key_tuple,var,entry_widget,direction):
+        def on_increment(event=None):
+            old_value=var.get(); entry_widget.unbind("<KeyRelease>")
+            increment_value(event,var,direction); new_value=var.get()
+            if old_value!=new_value:
+                action=EditAction(var,old_value,new_value,key_tuple,entry_widget,f"Increment {direction}")
+                undo_manager.record_action(action)
+            update_value(key_tuple,var)
+            entry_widget.bind("<KeyRelease>",make_offset_update_lambda(key_tuple,var,entry_widget))
+        return on_increment
 
-    row_p = 0
-    # Iterate directly on offsets.items() to preserve JSON order
-    for label_text, offset_val_list in offsets.items():
-        key_tuple = tuple(offset_val_list) # Key used for var/value dicts
+    row_p=0; row_s=0 
+    for lbl,off_list in offsets.items():
+        key_tuple=tuple(off_list)
+        # Corrected: "Font Size" should be "Size" in JSON keys for fonts for this logic.
+        # Or, adjust this check if JSON uses "Font Size"
+        is_font_related_size = "Size" in lbl and ("Font" in lbl or "Text" in lbl or "Team Name" in lbl or "Score" in lbl)
 
-        if "Size" not in label_text: # Heuristic for position vs size
-            col = 0 if "X" in label_text or "Width" in label_text else 4
-            tk.Label(positions_frame, text=label_text).grid(row=row_p, column=col, padx=10, pady=5, sticky="w")
-            entry = tk.Entry(positions_frame, textvariable=root.offsets_vars[key_tuple], width=10)
-            entry.grid(row=row_p, column=col+1, padx=10, pady=5)
-            entry.bind("<KeyRelease>", lambda e, kt=key_tuple, var=root.offsets_vars[key_tuple]: update_value(kt, var))
-            entry.bind('<KeyPress-Up>', lambda e, var=root.offsets_vars[key_tuple]: increment_value(e, var))
-            entry.bind('<KeyPress-Down>', lambda e, var=root.offsets_vars[key_tuple]: increment_value(e, var))
-            if col == 4 or "Y" in label_text or "Height" in label_text :
-                 row_p += 1
-    row_s = 0
-    for label_text, offset_val_list in offsets.items():
-        key_tuple = tuple(offset_val_list)
-        if "Size" in label_text:
-            tk.Label(sizes_frame, text=label_text).grid(row=row_s, column=0, padx=10, pady=5, sticky="w")
-            entry = tk.Entry(sizes_frame, textvariable=root.offsets_vars[key_tuple], width=10)
-            entry.grid(row=row_s, column=1, padx=10, pady=5)
-            entry.bind("<KeyRelease>", lambda e, kt=key_tuple, var=root.offsets_vars[key_tuple]: update_value(kt, var))
-            entry.bind('<KeyPress-Up>', lambda e, var=root.offsets_vars[key_tuple]: increment_value(e, var))
-            entry.bind('<KeyPress-Down>', lambda e, var=root.offsets_vars[key_tuple]: increment_value(e, var))
-            row_s += 1
 
-    row_c = 0
-    for label_text, offset_val_list in colors.items():
-        key_tuple = tuple(offset_val_list)
-        tk.Label(colors_frame, text=label_text).grid(row=row_c, column=0, padx=10, pady=5, sticky="w")
-        entry = tk.Entry(colors_frame, textvariable=root.color_vars[key_tuple], width=10)
-        entry.grid(row=row_c, column=1, padx=10, pady=5)
-        entry.bind('<KeyPress>', lambda e, var=root.color_vars[key_tuple]: restrict_color_entry(e, var))
-        entry.bind('<KeyRelease>', lambda e, kt=key_tuple, var=root.color_vars[key_tuple]: update_color_preview_from_entry(kt, var))
+        target_frame = None
+        current_row_ref = None 
+        base_col_for_entry = 1 
+        col_for_asterisk = 2   
+
+        if is_font_related_size: # Font Sizes specifically
+            target_frame = sizes_frame
+            current_row_ref = row_s
+            tk.Label(target_frame,text=lbl).grid(row=row_s,column=0,padx=5,pady=5,sticky="w")
+            entry=tk.Entry(target_frame,textvariable=root.offsets_vars[key_tuple],width=10)
+            entry.grid(row=row_s,column=1,padx=0,pady=5)
+            row_s +=1
+        elif "Size" in lbl : # Other general sizes (e.g., "Image Width Size")
+            target_frame = sizes_frame
+            current_row_ref = row_s
+            tk.Label(target_frame,text=lbl).grid(row=row_s,column=0,padx=5,pady=5,sticky="w")
+            entry=tk.Entry(target_frame,textvariable=root.offsets_vars[key_tuple],width=10)
+            entry.grid(row=row_s,column=1,padx=0,pady=5)
+            row_s +=1
+        elif not lbl.startswith("Image_"): # Positions (X, Y, Width, Height that are not "Size")
+            target_frame = positions_frame
+            current_row_ref = row_p
+            col=0 if "X" in lbl or "Width" in lbl else 4 
+            tk.Label(target_frame,text=lbl).grid(row=row_p,column=col,padx=5,pady=5,sticky="w")
+            entry=tk.Entry(target_frame,textvariable=root.offsets_vars[key_tuple],width=10)
+            entry.grid(row=row_p,column=col+1,padx=0,pady=5)
+            base_col_for_entry = col + 1 
+            col_for_asterisk = col+2
+            if col==4 or "Y" in lbl or "Height" in lbl: row_p+=1
+        else: 
+            continue 
         
-        color_preview_label = tk.Label(colors_frame, bg=root.color_values[key_tuple], width=3, height=1, relief="sunken")
-        color_preview_label.grid(row=row_c, column=2, padx=10, pady=5)
-        color_preview_label.bind("<Button-1>", lambda e, kt=key_tuple, var=root.color_vars[key_tuple]: choose_color(kt, var))
-        root.color_previews[key_tuple] = color_preview_label
-        row_c += 1
-
-def format_filesize(size_bytes: int) -> str:
-    """Converts a size in bytes to a human-readable string (KB or MB)."""
-    if size_bytes < 1024:
-        return f"{size_bytes} bytes"
-    elif size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.2f} KB"
-    else:
-        return f"{size_bytes / (1024 * 1024):.2f} MB"
+        if target_frame: 
+            update_lambda=make_offset_update_lambda(key_tuple,root.offsets_vars[key_tuple],entry)
+            entry.bind("<KeyRelease>",update_lambda); entry.bind("<FocusOut>",update_lambda)
+            entry.bind('<KeyPress-Up>',make_increment_lambda(key_tuple,root.offsets_vars[key_tuple],entry,"Up"))
+            entry.bind('<KeyPress-Down>',make_increment_lambda(key_tuple,root.offsets_vars[key_tuple],entry,"Down"))
+            asterisk_lbl=tk.Label(target_frame,text="",fg="red",width=1)
+            asterisk_lbl.grid(row=current_row_ref,column=col_for_asterisk,padx=(0,5),pady=5,sticky="w")
+            root.asterisk_labels[key_tuple]=asterisk_lbl
+            root.offset_entry_widgets[key_tuple]=entry
+            
+    row_c=0
+    for lbl,off_list in colors.items():
+        key_tuple=tuple(off_list)
+        tk.Label(colors_frame,text=lbl).grid(row=row_c,column=0,padx=5,pady=5,sticky="w")
+        entry=tk.Entry(colors_frame,textvariable=root.color_vars[key_tuple],width=10)
+        entry.grid(row=row_c,column=1,padx=0,pady=5)
+        def make_color_update_lambda(k_t,var,entry_w):
+            def on_color_update(event=None):
+                old_val=original_loaded_colors.get(k_t,"")
+                new_val=var.get()
+                is_focus_out_after_key=(event and event.type==tk.EventType.FocusOut and hasattr(entry_w,'_undo_recorded_for_this_change') and entry_w._undo_recorded_for_this_change)
+                if old_val!=new_val and not is_focus_out_after_key:
+                    if not (event and event.type==tk.EventType.FocusOut):
+                        action=EditAction(var,old_val,new_val,k_t,entry_w,f"Color change for {k_t}")
+                        undo_manager.record_action(action)
+                    if event and event.type==tk.EventType.KeyRelease: entry_w._undo_recorded_for_this_change=True
+                update_color_preview_from_entry(k_t,var)
+                if event and event.type==tk.EventType.FocusOut:
+                    if hasattr(entry_w,'_undo_recorded_for_this_change'): delattr(entry_w,'_undo_recorded_for_this_change')
+            return on_color_update
+        color_update_lambda=make_color_update_lambda(key_tuple,root.color_vars[key_tuple],entry)
+        entry.bind('<KeyPress>',lambda e,v=root.color_vars[key_tuple]:restrict_color_entry(e,v))
+        entry.bind('<KeyRelease>',color_update_lambda); entry.bind("<FocusOut>",color_update_lambda)
+        preview_lbl=tk.Label(colors_frame,bg=root.color_vars[key_tuple].get(),width=3,height=1,relief="sunken")
+        preview_lbl.grid(row=row_c,column=2,padx=5,pady=5)
+        def make_choose_color_lambda(k_t,var_obj,preview_widget,entry_ref):
+            def on_choose_color(event=None):
+                old_color=var_obj.get(); choose_color(k_t,var_obj,preview_widget); new_color=var_obj.get()
+                if old_color!=new_color:
+                    action=EditAction(var_obj,old_color,new_color,k_t,entry_ref,f"Choose color for {k_t}")
+                    undo_manager.record_action(action)
+            return on_choose_color
+        preview_lbl.bind("<Button-1>",make_choose_color_lambda(key_tuple,root.color_vars[key_tuple],preview_lbl,entry))
+        root.color_previews[key_tuple]=preview_lbl
+        asterisk_lbl_color=tk.Label(colors_frame,text="",fg="red",width=1)
+        asterisk_lbl_color.grid(row=row_c,column=3,padx=(0,5),pady=5,sticky="w")
+        root.asterisk_labels[key_tuple]=asterisk_lbl_color; row_c+=1
 
 def save_file():
-    global file_path
-    if not file_path:
-        messagebox.showerror("Error", "No file loaded.")
-        return
-    if not hasattr(root, 'offsets_vars') or not hasattr(root, 'color_vars'):
-        messagebox.showerror("Error", "Editor data not initialized.")
-        return
-
+    global file_path,original_loaded_offsets,original_loaded_colors
+    if not file_path: messagebox.showerror("Error","No file."); return
+    if not hasattr(root,'offsets_vars') or not hasattr(root,'color_vars'): messagebox.showerror("Error","Data not init."); return
     try:
-        with open(file_path, 'r+b') as file: # Open in read-write binary
-            for offset_tuple_key, var_obj in root.offsets_vars.items():
-                value_str = var_obj.get()
+        with open(file_path,'r+b') as f:
+            for off_key,var_obj in root.offsets_vars.items():
+                val_str=var_obj.get()
                 try:
-                    value_float = float(value_str)
-                    packed_value = struct.pack('<f', value_float)
-                    for single_offset_addr in offset_tuple_key:
-                        file.seek(single_offset_addr)
-                        file.write(packed_value)
-                except ValueError:
-                    messagebox.showerror("Save Error", f"Invalid float value '{value_str}' for {offset_tuple_key}.")
-                    return
-                except Exception as e_write:
-                    messagebox.showerror("Save Error", f"Failed writing to offset {single_offset_addr} in {offset_tuple_key}: {e_write}")
-                    return
-
-            for offset_tuple_key, var_obj in root.color_vars.items():
-                color_code_hex = var_obj.get()
-                if not (len(color_code_hex) == 7 and color_code_hex.startswith('#')):
-                    messagebox.showerror("Save Error", f"Invalid color format '{color_code_hex}' for {offset_tuple_key}. Expected #RRGGBB.")
-                    return
+                    val_f=float(val_str); packed=struct.pack('<f',val_f)
+                except ValueError: messagebox.showerror("Save Err",f"Bad float '{val_str}' for {off_key}"); return
+                for addr in off_key: f.seek(addr); f.write(packed)
+                original_loaded_offsets[off_key]=val_str
+                if off_key in root.asterisk_labels: root.asterisk_labels[off_key].config(text="")
+            for off_key,var_obj in root.color_vars.items():
+                hex_str=var_obj.get()
+                if not (len(hex_str)==7 and hex_str.startswith('#')):
+                    messagebox.showerror("Save Err",f"Bad color '{hex_str}' for {off_key}"); return
                 try:
-                    r_val = int(color_code_hex[1:3], 16)
-                    g_val = int(color_code_hex[3:5], 16)
-                    b_val = int(color_code_hex[5:7], 16)
-                    # Assuming BGRA format for writing, with fixed Alpha FF
-                    color_bytes_bgra = bytes([b_val, g_val, r_val, 0xFF])
-                    for single_offset_addr in offset_tuple_key:
-                        file.seek(single_offset_addr)
-                        file.write(color_bytes_bgra)
-                except ValueError:
-                    messagebox.showerror("Save Error", f"Invalid color hex in '{color_code_hex}' for {offset_tuple_key}.")
-                    return
-                except Exception as e_write_color:
-                    messagebox.showerror("Save Error", f"Failed writing color to offset {single_offset_addr} in {offset_tuple_key}: {e_write_color}")
-                    return
-        update_status("File saved successfully.", "green")
-    except Exception as e_file_open:
-        messagebox.showerror("Save Error", f"Failed to open/save file: {e_file_open}")
+                    r_val,g_val,b_val=int(hex_str[1:3],16),int(hex_str[3:5],16),int(hex_str[5:7],16)
+                    bgra=bytes([b_val,g_val,r_val,0xFF]) 
+                except ValueError: messagebox.showerror("Save Err",f"Bad hex '{hex_str}' for {off_key}"); return
+                for addr in off_key: f.seek(addr); f.write(bgra)
+                original_loaded_colors[off_key]=hex_str
+                if off_key in root.asterisk_labels: root.asterisk_labels[off_key].config(text="")
+        update_status("File saved successfully.","green"); undo_manager.clear_history()
+    except Exception as e: messagebox.showerror("Save Err",f"Open/Save fail: {e}")
 
-def update_value(offset_key_tuple, string_var):
-    try:
-        # Validate if it's a float, but keep as string in offsets_values for consistency with get()
-        float(string_var.get()) 
-        if hasattr(root, 'offsets_values') and offset_key_tuple in root.offsets_values:
-            root.offsets_values[offset_key_tuple] = string_var.get()
-            update_status("Value Updated!", "blue") # Less alarming color
-    except ValueError:
-        update_status("Invalid float value entered", "red")
-
-def increment_value(event, string_var):
-    try:
-        current_val_str = string_var.get()
-        if not current_val_str or current_val_str == "ERR": current_val_str = "0.0"
-        value_float = float(current_val_str)
-        
-        increment_amt = 0.1 if event.state & 0x0001 else 1.0 # Shift for smaller, Ctrl for larger? Finer control
-        if event.state & 0x0004: # Ctrl key
-            increment_amt = 0.01
-
-        if event.keysym == 'Up':
-            value_float += increment_amt
-        elif event.keysym == 'Down':
-            value_float -= increment_amt
-        
-        # Format to a reasonable number of decimal places
-        string_var.set(f"{value_float:.4f}") 
-        if hasattr(root, 'offsets_vars'): # Find key and update internal store
-            for key, s_var_lookup in root.offsets_vars.items():
-                if s_var_lookup == string_var:
-                    update_value(key, string_var)
-                    break
-    except ValueError:
-        update_status("Invalid value for increment", "red")
-
-def update_color_preview_from_entry(offset_key_tuple, string_var):
-    color_code = string_var.get()
-    if len(color_code) == 7 and color_code.startswith("#"):
-        try:
-            int(color_code[1:], 16) # Validate hex
-            if hasattr(root, 'color_previews') and offset_key_tuple in root.color_previews:
-                root.color_previews[offset_key_tuple].config(bg=color_code)
-            if hasattr(root, 'color_values'):
-                root.color_values[offset_key_tuple] = color_code
-            update_status("Color Preview Updated", "blue")
-        except ValueError:
-            update_status("Invalid hex color", "red")
-    elif len(color_code) > 0 and not color_code.startswith("#"): # Auto-prepend # if missing and started typing
-        if all(c in "0123456789abcdefABCDEF" for c in color_code) and len(color_code) <= 6:
-            string_var.set("#" + color_code)
-            update_color_preview_from_entry(offset_key_tuple, string_var) # Recurse once
-        else:
-             update_status("Color must be hex, start with #", "orange")
-
-
-def update_color_preview(offset_key_tuple, color_code):
-    if hasattr(root, 'color_previews') and offset_key_tuple in root.color_previews:
-        try:
-            root.color_previews[offset_key_tuple].config(bg=color_code)
-        except tk.TclError:
-            update_status(f"Invalid color code for preview: {color_code}", "red")
-
-
-def choose_color(offset_key_tuple, string_var):
-    current_color_hex = string_var.get()
-    if not (current_color_hex.startswith("#") and len(current_color_hex) == 7) :
-         current_color_hex = "#000000"
+def update_value(offset_key_tuple, string_var, from_undo_redo=False):
+    global composite_mode_active, composite_elements, offsets
+    global original_loaded_offsets
     
-    new_color_info = colorchooser.askcolor(initialcolor=current_color_hex)
-    if new_color_info and new_color_info[1]:  # [1] is the hex string
-        chosen_hex_color = new_color_info[1]
-        string_var.set(chosen_hex_color)
-        update_color_preview(offset_key_tuple, chosen_hex_color)
-        if hasattr(root, 'color_values'):
-            root.color_values[offset_key_tuple] = chosen_hex_color
-        update_status("Color Chosen", "green")
+    val_str = string_var.get()
+    if not from_undo_redo: logging.debug(f"update_value for {offset_key_tuple} with '{val_str}'")
+    
+    try:
+        new_game_offset_val = float(val_str) # This is the IN-GAME value (e.g. 36 for font size)
+    except ValueError:
+        if not from_undo_redo: update_status(f"Invalid float '{val_str}'", "red")
+        if offset_key_tuple in root.asterisk_labels: root.asterisk_labels[offset_key_tuple].config(text="!")
+        return
 
-def update_status(message, color_fg):
-    status_label.config(text=message, fg=color_fg)
+    if offset_key_tuple in root.asterisk_labels:
+        original_val = original_loaded_offsets.get(offset_key_tuple)
+        is_changed = True
+        if original_val is not None:
+            try:
+                if abs(float(original_val) - new_game_offset_val) < 0.0001: is_changed = False
+            except ValueError: pass
+        root.asterisk_labels[offset_key_tuple].config(text="*" if is_changed else "")
+    
+    if not from_undo_redo: update_status(f"Game offset for {offset_key_tuple} now {new_game_offset_val:.2f}", "blue")
+
+    if composite_mode_active:
+        visual_updated_overall = False 
+        
+        current_offset_json_label = None
+        for label, off_list in offsets.items():
+            if tuple(off_list) == offset_key_tuple:
+                current_offset_json_label = label
+                break
+        
+        if not current_offset_json_label:
+            logging.warning(f"Could not find JSON label for offset key {offset_key_tuple} during update_value.")
+            return 
+
+        # Adjusted condition to match typical JSON labels like "Home Team Name Size"
+        is_this_a_font_size_update = " Size" in current_offset_json_label and \
+                                   any(keyword in current_offset_json_label for keyword in ["Font", "Text", "Name", "Score"])
+
+
+        for el_data in composite_elements:
+            element_was_modified = False
+
+            is_x_offset = (el_data.get('x_offset_label_linked') == current_offset_json_label)
+            is_y_offset = (el_data.get('y_offset_label_linked') == current_offset_json_label)
+
+            if is_x_offset or is_y_offset:
+                gui_ref_x, gui_ref_y = el_data.get('gui_ref_x'), el_data.get('gui_ref_y')
+                base_game_x, base_game_y = el_data.get('base_game_x'), el_data.get('base_game_y')
+                
+                if gui_ref_x is not None and gui_ref_y is not None:
+                    if is_x_offset and base_game_x is not None:
+                        el_data['original_x'] = float(gui_ref_x) + (new_game_offset_val - base_game_x)
+                        element_was_modified = True
+                    if is_y_offset and base_game_y is not None:
+                        el_data['original_y'] = float(gui_ref_y) + (new_game_offset_val - base_game_y)
+                        element_was_modified = True
+                
+                if element_was_modified:
+                    logging.info(f"Comp: Position for '{el_data.get('display_tag')}' updated via Entry.")
+                    leader_tag = el_data.get('display_tag')
+                    if leader_tag:
+                        for follower_elem in composite_elements:
+                            if follower_elem.get('conjoined_to_tag') == leader_tag:
+                                follower_elem['original_x'] = el_data['original_x'] + follower_elem.get('relative_offset_x',0)
+                                follower_elem['original_y'] = el_data['original_y'] + follower_elem.get('relative_offset_y',0)
+            
+            if is_this_a_font_size_update and el_data.get('type') == "text" and \
+               el_data.get('font_size_offset_label_linked') == current_offset_json_label:
+                
+                gui_render_font_size = new_game_offset_val / 1.5 # Convert in-game value to GUI render value
+                el_data['base_font_size'] = gui_render_font_size 
+                element_was_modified = True
+                logging.info(f"Comp: Font for {el_data.get('display_tag')} (link: '{current_offset_json_label}') "
+                             f"updated. Game val: {new_game_offset_val} -> GUI render: {gui_render_font_size:.2f}")
+
+            if element_was_modified:
+                visual_updated_overall = True
+        
+        if visual_updated_overall:
+            redraw_composite_view()
+
+
+def increment_value(event, str_var, direction):
+    try:
+        current_val_str=str_var.get();
+        if not current_val_str or current_val_str=="ERR": current_val_str="0.0"
+        value_float=float(current_val_str)
+        increment_amt=1.0
+        if event.state&0x0001: increment_amt=0.1 
+        if event.state&0x0004: increment_amt=0.01 
+        if event.state&0x0001 and event.state&0x0004: increment_amt=0.001 
+            
+        if direction=='Up': value_float+=increment_amt
+        elif direction=='Down': value_float-=increment_amt
+        str_var.set(f"{value_float:.4f}")
+    except ValueError: update_status("Invalid value for increment","red")
+
+def update_color_preview_from_entry(off_key, str_var, from_undo_redo=False):
+    global original_loaded_colors
+    hex_str=str_var.get(); valid_hex=False
+    if len(hex_str)==7 and hex_str.startswith('#'):
+        try:
+            int(hex_str[1:],16); valid_hex=True
+            if hasattr(root,'color_previews') and off_key in root.color_previews:
+                root.color_previews[off_key].config(bg=hex_str)
+            if not from_undo_redo: update_status("Color preview updated","blue")
+            if composite_mode_active: redraw_composite_view()
+        except ValueError:
+            if not from_undo_redo: update_status("Bad hex color","red")
+    elif not from_undo_redo and len(hex_str)>0 and not hex_str.startswith('#') and \
+         all(c in "0123456789abcdefABCDEF" for c in hex_str) and len(hex_str)<=6:
+        str_var.set("#"+hex_str.upper()); update_color_preview_from_entry(off_key,str_var,from_undo_redo)
+        return 
+    if off_key in root.asterisk_labels:
+        original_color=original_loaded_colors.get(off_key)
+        is_changed=(original_color.lower()!=hex_str.lower()) if valid_hex and original_color else True
+        root.asterisk_labels[off_key].config(text="*" if is_changed else "")
+
+def choose_color(off_key, str_var, preview_widget):
+    old_color=str_var.get(); curr_hex=old_color
+    if not (curr_hex.startswith("#") and len(curr_hex)==7): curr_hex="#000000"
+    new_color_tuple=colorchooser.askcolor(initialcolor=curr_hex, title="Choose Color")
+    if new_color_tuple and new_color_tuple[1]:
+        chosen_hex=new_color_tuple[1].lower()
+        str_var.set(chosen_hex)
+        update_color_preview_from_entry(off_key, str_var)
+
+def update_status(msg,fg_col): status_label.config(text=msg,fg=fg_col)
 
 def about():
-    about_window = tk.Toplevel(root)
-    about_window.title("About")
-    about_window.geometry("420x270")
-    about_window.resizable(False, False)
-    bold_font = ("Helvetica", 12, "bold")
-    tk.Label(about_window, text="FLP Scoreboard Editor 25 By FIFA Legacy Project.", pady=10, font=bold_font).pack()
-    tk.Label(about_window, text="Version 1.0 [Build 09 May 2025]", pady=10).pack() # Date Updated
-    tk.Label(about_window, text="© 2025 FIFA Legacy Project. All Rights Reserved.", pady=10).pack()
-    tk.Label(about_window, text="Designed & Developed By Emran_Ahm3d.", pady=10).pack()
-    tk.Label(about_window, text="Special Thanks to Riesscar, KO, MCK and Marconis for the Research.", pady=10).pack()
-    tk.Label(about_window, text="Discord: @emran_ahm3d", pady=10).pack()
+    win=tk.Toplevel(root); win.title("About FLP Scoreboard Editor 25"); win.geometry("450x300")
+    win.resizable(False,False); win.transient(root); win.grab_set()
+    tk.Label(win,text="FLP Scoreboard Editor 25",pady=10,font=("Helvetica",12,"bold")).pack()
+    tk.Label(win,text="Version 1.13 [Build 10 May 2025]",pady=5).pack()
+    tk.Label(win,text="© 2025 FIFA Legacy Project. All Rights Reserved.",pady=5).pack()
+    tk.Label(win,text="Designed & Developed By: Emran_Ahm3d",pady=5).pack()
+    tk.Label(win,text="Special Thanks: Riesscar, KO, MCK, Marconis (Research)",pady=5,wraplength=400).pack()
+    tk.Label(win,text="Discord: @emran_ahm3d",pady=5).pack()
+    ttk.Button(win,text="OK",command=win.destroy,width=10).pack(pady=10); win.wait_window()
 
-def show_documentation():
-    webbrowser.open("https://soccergaming.com/")
+def show_documentation(): webbrowser.open("https://soccergaming.com/")
 
-def restrict_color_entry(event, string_var):
-    allowed_keys = ['Left', 'Right', 'BackSpace', 'Delete', 'Tab', 'Home', 'End']
-    if event.keysym in allowed_keys:
-        if event.keysym == 'BackSpace' and string_var.get() == '#':
-             if len(string_var.get()) <= 1 : return 'break' # Prevent deleting the initial '#'
-        return # Allow navigation/deletion
-
-    current_text = string_var.get()
-    char_typed = event.char
-
-    if not current_text and char_typed != '#':
-        string_var.set('#' + char_typed) # Auto-prepend '#'
-        return 'break' 
-    if current_text == '#' and char_typed == '#': # Prevent '##'
-        return 'break'
-
-    if len(current_text) >= 7 and not entry_has_selection(event.widget):
-        return 'break' # Limit length
-
-    if current_text.startswith('#'): # Only allow hex chars after #
-        if not char_typed.lower() in '0123456789abcdef':
-            return 'break'
-            
-def entry_has_selection(entry_widget) -> bool:
+def restrict_color_entry(event, str_var):
+    allowed_keysyms=['Left','Right','BackSpace','Delete','Tab','Home','End','Shift_L','Shift_R','Control_L','Control_R']
+    if event.keysym in allowed_keysyms: return
+    if event.state&0x4 and event.keysym.lower() in ('c','v','x'): return
+    current_text=str_var.get(); char_typed=event.char
+    if not char_typed or not char_typed.isprintable(): return
+    if not current_text and char_typed!='#':
+        str_var.set('#'+char_typed.upper())
+        event.widget.after_idle(lambda:event.widget.icursor(tk.END)); return 'break'
+    if current_text=='#' and char_typed=='#': return 'break'
+    has_selection=False
     try:
-        return entry_widget.selection_present()
-    except tk.TclError:
-        return False
+        if event.widget.selection_present(): has_selection=True
+    except tk.TclError: pass
+    if len(current_text)>=7 and not has_selection: return 'break'
+    if current_text.startswith('#'):
+        if not char_typed.lower() in '0123456789abcdef': return 'break'
 
 def exit_app():
-    if messagebox.askyesno("Exit", "Are you sure you want to exit?"):
-        root.destroy()
+    if messagebox.askyesno("Exit Application","Are you sure you want to exit?"): root.destroy()
 
 def import_texture():
-    global file_path, current_image_index, image_files, current_image, preview_bg_color_is_white
-
-    if not file_path:
-        messagebox.showerror("Error", "No file loaded.")
-        return
-
-    try:
-        big_file_obj = FifaBigFile(file_path) # Parse once for this operation
-    except Exception as e:
-        messagebox.showerror("Error", f"Failed to read BIG file: {e}")
-        return
-
-    if not image_files or not (0 <= current_image_index < len(image_files)):
-        messagebox.showerror("Error", "No valid texture selected for import.")
-        return
-    
-    file_name_to_replace = image_files[current_image_index]
-    
-    new_texture_path = filedialog.askopenfilename(
-        title=f"Import texture for {file_name_to_replace}.dds",
-        filetypes=[("DDS Files", "*.dds"), ("PNG Files", "*.png")]
-    )
+    global file_path,current_image_index,image_files
+    if not file_path: messagebox.showerror("Error","No .big file loaded."); return
+    if composite_mode_active: messagebox.showinfo("Info","Import/Export is disabled in Composite View mode."); return
+    try: big_file_obj=FifaBigFile(file_path)
+    except Exception as e: messagebox.showerror("Error",f"Failed to read BIG file for import: {e}"); logging.error(f"BIG read error import: {e}",exc_info=True); return
+    if not image_files or not (0<=current_image_index<len(image_files)): messagebox.showerror("Error","No valid texture selected for import."); return
+    file_name_to_replace=image_files[current_image_index]
+    original_entry_obj=next((entry for entry in big_file_obj.entries if entry.name==file_name_to_replace),None)
+    if original_entry_obj is None: messagebox.showerror("Error",f"File '{file_name_to_replace}' not found in BIG archive."); return
+    new_texture_path=filedialog.askopenfilename(title=f"Import texture for {file_name_to_replace}.dds",filetypes=[("DDS Files","*.dds"),("PNG Files","*.png")])
     if not new_texture_path: return
-
-    original_entry_obj = next((entry for entry in big_file_obj.entries if entry.name == file_name_to_replace), None)
-    
-    if original_entry_obj is None:
-        messagebox.showerror("Error", f"File '{file_name_to_replace}' not found in the BIG archive structure.")
-        return
-    
-    # original_entry_obj.raw_size is the size of (possibly compressed) data in BIG file
-    # original_entry_obj.offset is where it starts
-    # original_entry_obj.compression tells if it was EAHD
-
-    new_data_uncompressed = None
-    temp_dds_for_import_path = None
-
+    new_data_uncompressed=None; temp_dds_for_import_path=None
     try:
         if new_texture_path.lower().endswith(".png"):
-            with Image.open(new_texture_path) as pil_img:
-                pil_img_rgba = pil_img.convert("RGBA")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_dds_f:
-                temp_dds_for_import_path = temp_dds_f.name
-                pil_img_rgba.save(temp_dds_for_import_path, "DDS") # Default DDS format (often DXT5 with alpha)
-            with open(temp_dds_for_import_path, 'rb') as f_dds_read:
-                new_data_uncompressed = f_dds_read.read()
+            try:
+                with Image.open(new_texture_path) as pil_img: pil_img_rgba=pil_img.convert("RGBA")
+                with tempfile.NamedTemporaryFile(delete=False,suffix=".dds") as temp_dds_f:
+                    temp_dds_for_import_path=temp_dds_f.name; pil_img_rgba.save(temp_dds_for_import_path,"DDS")
+                with open(temp_dds_for_import_path,'rb') as f_dds_read: new_data_uncompressed=f_dds_read.read()
+                logging.info(f"Converted {new_texture_path} to temp DDS.")
+            except Exception as e_png_conv: messagebox.showerror("PNG Conversion Error",f"Failed to convert PNG to DDS: {e_png_conv}"); logging.error(f"PNG to DDS error: {e_png_conv}",exc_info=True); return
         elif new_texture_path.lower().endswith(".dds"):
-            with open(new_texture_path, 'rb') as new_f:
-                new_data_uncompressed = new_f.read()
-        else:
-            messagebox.showerror("Error", "Unsupported file type. Select DDS or PNG.")
-            return
-
-        if not new_data_uncompressed:
-            messagebox.showerror("Error", "Failed to read new texture data.")
-            return
-
-        data_to_write_in_big = new_data_uncompressed
-        compression_applied_msg = ""
-
-        if original_entry_obj.compression == Compression.EAHD:
-            logging.info(f"Original texture '{file_name_to_replace}' was EAHD. Attempting to compress new texture.")
-            # data_to_write_in_big = Decompressor.compress_eahd(new_data_uncompressed) # This should be Compressor
-            data_to_write_in_big = Compressor.compress_eahd(new_data_uncompressed) # Use placeholder
-            if data_to_write_in_big is new_data_uncompressed: # Check if compression was real or placeholder
-                 compression_applied_msg = "(EAHD compression placeholder used; data uncompressed)"
-            else:
-                 compression_applied_msg = "(EAHD compression attempted)"
-
-
-        # Size check using the data that will actually be written
-        if original_entry_obj.raw_size > 0 and len(data_to_write_in_big) > original_entry_obj.raw_size:
-            msg = (f"New file ({format_filesize(len(data_to_write_in_big))}) is larger than the "
-                   f"original allocated space ({format_filesize(original_entry_obj.raw_size)}) "
-                   f"for '{file_name_to_replace}'. Import aborted. {compression_applied_msg}")
-            messagebox.showerror("Size Error", msg)
-            return
-        
-        # Write to the BIG file
-        with open(file_path, 'r+b') as f_big_write:
-            f_big_write.seek(original_entry_obj.offset)
-            f_big_write.write(data_to_write_in_big)
-            # If new data is smaller, pad with nulls up to original raw_size
-            if original_entry_obj.raw_size > 0 and len(data_to_write_in_big) < original_entry_obj.raw_size:
-                padding_size = original_entry_obj.raw_size - len(data_to_write_in_big)
-                f_big_write.write(b'\x00' * padding_size)
-        
-        success_msg = (f"Imported '{os.path.basename(new_texture_path)}' as '{file_name_to_replace}.dds'.\n"
-                       f"Original raw slot: {format_filesize(original_entry_obj.raw_size)}, "
-                       f"New data size: {format_filesize(len(data_to_write_in_big))}. {compression_applied_msg}")
-        messagebox.showinfo("Success", success_msg)
-
-        # Refresh preview with the newly imported (uncompressed version for display)
-        # The `new_data_uncompressed` is what we want to display.
-        display_data_for_preview = new_data_uncompressed # Always show the uncompressed form
-        temp_preview_dds_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_prev_f:
-                temp_preview_dds_path = temp_prev_f.name
-                temp_prev_f.write(display_data_for_preview)
-
-            with Image.open(temp_preview_dds_path) as pil_img_prev:
-                original_width, original_height = pil_img_prev.width, pil_img_prev.height
-                bg_tuple = (255,255,255,255) if preview_bg_color_is_white else (0,0,0,255)
-                pil_img_prev_rgba = pil_img_prev.convert('RGBA') if pil_img_prev.mode != 'RGBA' else pil_img_prev
-                
-                bg_img = Image.new('RGBA', pil_img_prev_rgba.size, bg_tuple)
-                combined_img = Image.alpha_composite(bg_img, pil_img_prev_rgba)
-                current_image = combined_img.copy()
-
-                # Scale for display
-                canvas_w = preview_canvas.winfo_width()
-                canvas_h = preview_canvas.winfo_height()
-                ratio_prev = min(canvas_w / combined_img.width, canvas_h / combined_img.height)
-                disp_w, disp_h = combined_img.width, combined_img.height
-                if ratio_prev < 1.0:
-                    disp_w = int(disp_w * ratio_prev)
-                    disp_h = int(disp_h * ratio_prev)
-                
-                tk_disp_img = ImageTk.PhotoImage(combined_img.resize((disp_w, disp_h), Image.LANCZOS))
-                preview_canvas.delete("all")
-                preview_canvas.create_image(canvas_w//2, canvas_h//2, anchor=tk.CENTER, image=tk_disp_img, tags="image_on_canvas")
-                preview_canvas.image_ref = tk_disp_img
-            
-            texture_label.config(text=f"{file_name_to_replace}.dds (Imported)")
-            image_dimensions_label.config(text=f"{original_width}x{original_height}")
-            global zoom_level
-            zoom_level = 1.0
-        except Exception as e_prev:
-            messagebox.showerror("Preview Error", f"Failed to update preview after import: {e_prev}")
-        finally:
-            if temp_preview_dds_path and os.path.exists(temp_preview_dds_path):
-                os.remove(temp_preview_dds_path)
-    except Exception as e_import:
-        messagebox.showerror("Import Error", f"Failed to import texture: {e_import}")
-        logging.error(f"Import texture error: {e_import}", exc_info=True)
+            with open(new_texture_path,'rb') as new_f: new_data_uncompressed=new_f.read()
+            logging.info(f"Read DDS {new_texture_path} for import.")
+        else: messagebox.showerror("Error","Unsupported file type. Select DDS or PNG."); return
+        if not new_data_uncompressed: messagebox.showerror("Error","Failed to read new texture data."); return
+        data_to_write_in_big=new_data_uncompressed; compression_applied_msg=""
+        if original_entry_obj.compression==Compression.EAHD:
+            logging.info(f"Original '{file_name_to_replace}' was EAHD. Compressing new texture.")
+            data_to_write_in_big=Compressor.compress_eahd(new_data_uncompressed)
+            if data_to_write_in_big is new_data_uncompressed: compression_applied_msg="(EAHD compression placeholder; data uncompressed)"
+            else: compression_applied_msg="(EAHD compression attempted)"
+            logging.info(f"Compression: {compression_applied_msg}")
+        if original_entry_obj.raw_size>0 and len(data_to_write_in_big)>original_entry_obj.raw_size:
+            msg=(f"New data ({format_filesize(len(data_to_write_in_big))}) > original slot ({format_filesize(original_entry_obj.raw_size)}) for '{file_name_to_replace}'. Import aborted. {compression_applied_msg}")
+            messagebox.showerror("Size Error",msg); logging.warning(msg); return
+        with open(file_path,'r+b') as f_big_write:
+            f_big_write.seek(original_entry_obj.offset); f_big_write.write(data_to_write_in_big)
+            if original_entry_obj.raw_size>0 and len(data_to_write_in_big)<original_entry_obj.raw_size:
+                padding_size=original_entry_obj.raw_size-len(data_to_write_in_big)
+                f_big_write.write(b'\x00'*padding_size); logging.info(f"Padded import with {padding_size} bytes.")
+        success_msg=(f"Imported '{os.path.basename(new_texture_path)}' as '{file_name_to_replace}.dds'.\n"
+                       f"Original slot: {format_filesize(original_entry_obj.raw_size)}, New data: {format_filesize(len(data_to_write_in_big))}. {compression_applied_msg}")
+        messagebox.showinfo("Import Successful",success_msg); logging.info(success_msg)
+        if not extract_and_display_texture(): messagebox.showwarning("Preview Warning","Could not refresh preview.")
+        else: update_status(f"Texture {file_name_to_replace}.dds imported.","green")
+    except Exception as e_import: messagebox.showerror("Import Error",f"Unexpected import error: {e_import}"); logging.error(f"General import error: {e_import}",exc_info=True)
     finally:
         if temp_dds_for_import_path and os.path.exists(temp_dds_for_import_path):
-            os.remove(temp_dds_for_import_path)
-
+            try: os.remove(temp_dds_for_import_path)
+            except Exception as e_clean: logging.warning(f"Could not remove temp import file: {e_clean}")
 
 def export_selected_file():
-    global file_path, current_image_index, image_files
-    if not file_path: messagebox.showerror("Error", "No file loaded."); return
-    if not image_files or not (0 <= current_image_index < len(image_files)):
-        messagebox.showerror("Error", "No texture selected."); return
-
-    file_name_to_export = image_files[current_image_index]
-    
-    try:
-        big_file_obj = FifaBigFile(file_path)
-    except Exception as e:
-        messagebox.showerror("Error", f"Could not read BIG file for export: {e}"); return
-
-    entry_obj_to_export = next((e for e in big_file_obj.entries if e.name == file_name_to_export), None)
-    
-    if not entry_obj_to_export or entry_obj_to_export.size == 0 or not entry_obj_to_export.data:
-        messagebox.showerror("Error", f"File '{file_name_to_export}' not found or has no data."); return
-
-    data_for_export = entry_obj_to_export.data # Decompressed data
-    
-    export_target_path = filedialog.asksaveasfilename(
-        defaultextension=".png",
-        filetypes=[("PNG Files", "*.png"), ("DDS Files", "*.dds")],
-        initialfile=os.path.basename(file_name_to_export)
-    )
+    global file_path,current_image_index,image_files
+    if not file_path: messagebox.showerror("Error","No .big file loaded."); return
+    if composite_mode_active: messagebox.showinfo("Info","Import/Export is disabled in Composite View mode."); return
+    if not image_files or not (0<=current_image_index<len(image_files)): messagebox.showerror("Error","No texture selected."); return
+    file_name_to_export=image_files[current_image_index]
+    try: big_file_obj=FifaBigFile(file_path)
+    except Exception as e: messagebox.showerror("Error",f"Could not read BIG for export: {e}"); logging.error(f"BIG read error export: {e}",exc_info=True); return
+    entry_obj_to_export=next((e for e in big_file_obj.entries if e.name==file_name_to_export),None)
+    if not entry_obj_to_export or entry_obj_to_export.size==0 or not entry_obj_to_export.data:
+        messagebox.showerror("Error",f"File '{file_name_to_export}' not found or empty."); return
+    data_for_export=entry_obj_to_export.data
+    export_target_path=filedialog.asksaveasfilename(defaultextension=".png",filetypes=[("PNG Files","*.png"),("DDS Files","*.dds")],initialfile=f"{file_name_to_export}")
     if not export_target_path: return
-
+    temp_dds_path_for_export=None
     try:
         if export_target_path.lower().endswith(".png"):
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".dds") as temp_dds_f:
-                temp_dds_f.write(data_for_export)
-                temp_dds_path_export = temp_dds_f.name
-            try:
-                with Image.open(temp_dds_path_export) as pil_img_export:
-                    pil_img_export.save(export_target_path, "PNG")
-                messagebox.showinfo("Success", f"Exported '{file_name_to_export}.dds' as PNG to '{export_target_path}'")
-            finally:
-                if os.path.exists(temp_dds_path_export): os.remove(temp_dds_path_export)
+            with tempfile.NamedTemporaryFile(delete=False,suffix=".dds") as temp_dds_f:
+                temp_dds_f.write(data_for_export);temp_dds_path_for_export=temp_dds_f.name
+            with Image.open(temp_dds_path_for_export) as pil_img_export: pil_img_export.save(export_target_path,"PNG")
+            messagebox.showinfo("Export Successful",f"Exported '{file_name_to_export}.dds' as PNG to:\n'{export_target_path}'")
+            logging.info(f"Exported {file_name_to_export}.dds as PNG to {export_target_path}")
         elif export_target_path.lower().endswith(".dds"):
-            with open(export_target_path, 'wb') as out_f_dds:
-                out_f_dds.write(data_for_export)
-            messagebox.showinfo("Success", f"Exported '{file_name_to_export}.dds' as DDS to '{export_target_path}'")
-        else:
-            messagebox.showerror("Error", "Unsupported export format. Choose .png or .dds.")
-    except Exception as e_export:
-        messagebox.showerror("Export Error", f"Failed to export file: {e_export}")
-
+            with open(export_target_path,'wb') as out_f_dds: out_f_dds.write(data_for_export)
+            messagebox.showinfo("Export Successful",f"Exported '{file_name_to_export}.dds' as DDS to:\n'{export_target_path}'")
+            logging.info(f"Exported {file_name_to_export}.dds as DDS to {export_target_path}")
+        else: messagebox.showerror("Error","Unsupported export format. Choose .png or .dds.")
+    except Exception as e_export: messagebox.showerror("Export Error",f"Failed to export file: {e_export}"); logging.error(f"Export fail: {e_export}",exc_info=True)
+    finally:
+        if temp_dds_path_for_export and os.path.exists(temp_dds_path_for_export):
+            try: os.remove(temp_dds_path_for_export)
+            except Exception as e_clean_export: logging.warning(f"Could not remove temp export file: {e_clean_export}")
 
 def previous_image():
-    global current_image_index
-    if not file_path or not image_files: return
-    
-    original_idx = current_image_index
-    num_files = len(image_files)
-    for _ in range(num_files): # Try each file at most once
-        current_image_index = (current_image_index - 1 + num_files) % num_files
+    global current_image_index,composite_mode_active
+    if composite_mode_active or not file_path or not image_files: return
+    original_idx=current_image_index; num_files=len(image_files)
+    if num_files==0: return
+    for i in range(num_files):
+        current_image_index=(original_idx-1-i+num_files*2)%num_files
         if extract_and_display_texture(): return
-        if current_image_index == original_idx: break # Cycled through all
-    # logging.info("No other displayable textures found (previous).")
-
+    current_image_index=original_idx
+    if not extract_and_display_texture():
+        preview_canvas.delete("all");texture_label.config(text="No displayable textures");current_image=None
 
 def next_image():
-    global current_image_index
-    if not file_path or not image_files: return
-
-    original_idx = current_image_index
-    num_files = len(image_files)
-    for _ in range(num_files):
-        current_image_index = (current_image_index + 1) % num_files
+    global current_image_index,composite_mode_active
+    if composite_mode_active or not file_path or not image_files: return
+    original_idx=current_image_index; num_files=len(image_files)
+    if num_files==0: return
+    for i in range(num_files):
+        current_image_index=(original_idx+1+i)%num_files
         if extract_and_display_texture(): return
-        if current_image_index == original_idx: break
-    # logging.info("No other displayable textures found (next).")
+    current_image_index=original_idx
+    if not extract_and_display_texture():
+        preview_canvas.delete("all");texture_label.config(text="No displayable textures");current_image=None
 
 def toggle_preview_background():
-    global preview_bg_color_is_white, toggle_bg_button
+    global preview_bg_color_is_white,composite_mode_active
+    if composite_mode_active: return
     preview_bg_color_is_white = not preview_bg_color_is_white
-    
-    # Button text is static "Toggle Alpha" as per latest script from user
-    # toggle_bg_button.config(text="Set BG: Black" if preview_bg_color_is_white else "Set BG: White")
+    if file_path and current_image: extract_and_display_texture()
+
+def toggle_composite_mode():
+    global composite_mode_active,current_image_index,image_files,current_image,composite_zoom_level,composite_pan_offset_x,composite_pan_offset_y
+    global import_button,export_button,highlighted_offset_entries,toggle_bg_button
+    logging.info(f"Toggling composite. Current: {composite_mode_active}")
+    if not composite_mode_active:
+        is_ok=internal_name_label.cget("text").startswith("Internal Name: ") and \
+              not internal_name_label.cget("text").endswith("(No Config)") and \
+              not internal_name_label.cget("text").endswith("(Detection Failed)")
+        if not file_path or not is_ok:
+            messagebox.showinfo("Info","Load .big with valid config first."); logging.warning("Composite prereqs not met."); return
+        target_img_name="10"
+        if not (0<=current_image_index<len(image_files) and image_files[current_image_index]==target_img_name):
+            logging.info(f"Not on {target_img_name}. Switching.")
+            try:
+                idx_10=image_files.index(target_img_name); current_image_index=idx_10
+                _temp_comp_active=composite_mode_active; composite_mode_active=False
+                success_load_10=extract_and_display_texture(); composite_mode_active=_temp_comp_active
+                if not success_load_10:
+                    messagebox.showerror("Error",f"Could not load {target_img_name}.dds. Cannot enter composite."); logging.error(f"Failed load {target_img_name}.dds."); return
+                root.update_idletasks()
+            except ValueError: messagebox.showerror("Error",f"'{target_img_name}' not in image_files. Cannot enter composite."); return
+        preview_canvas.delete("all");current_image=None;texture_label.config(text="");image_dimensions_label.config(text="")
+        composite_mode_active=True;composite_zoom_level=1.0;composite_pan_offset_x=250.0;composite_pan_offset_y=50.0
+        display_composite_view()
+        if not composite_mode_active: logging.warning("display_composite_view failed."); return
+        composite_view_button.config(text="Single View");left_arrow_button.pack_forget();right_arrow_button.pack_forget()
+        import_button.config(state=tk.DISABLED);export_button.config(state=tk.DISABLED);toggle_bg_button.config(state=tk.DISABLED)
+        logging.info("Switched TO composite successfully.")
+    else:
+        clear_all_highlights();logging.info("Switching FROM composite.")
+        composite_mode_active=False;clear_composite_view()
+        composite_view_button.config(text="Composite View")
+        left_arrow_button.pack(side=tk.LEFT,padx=(0,5),pady=5,anchor='center')
+        right_arrow_button.pack(side=tk.LEFT,padx=5,pady=5,anchor='center')
+        import_button.config(state=tk.NORMAL);export_button.config(state=tk.NORMAL);toggle_bg_button.config(state=tk.NORMAL)
+        if file_path: extract_and_display_texture()
+        else: preview_canvas.delete("all");texture_label.config(text="No file");image_dimensions_label.config(text="")
+        logging.info("Switched FROM composite.")
+
+def clear_all_highlights():
+    global highlighted_offset_entries
+    for entry_widget,original_bg in highlighted_offset_entries:
+        try:
+            if entry_widget.winfo_exists(): entry_widget.config(bg=original_bg)
+        except tk.TclError: pass
+    highlighted_offset_entries.clear()
+
+def clear_composite_view():
+    global composite_elements,preview_canvas
+    preview_canvas.delete("composite_item")
+    for el in composite_elements:
+        if 'tk_image_ref' in el and el['tk_image_ref']: del el['tk_image_ref']
+    composite_elements.clear(); preview_canvas.config(bg="#CCCCCC")
+
+def redraw_composite_view():
+    global composite_elements,preview_canvas,composite_zoom_level,composite_pan_offset_x,composite_pan_offset_y,colors,root
+    preview_canvas.delete("composite_item"); canvas_w=preview_canvas.winfo_width(); canvas_h=preview_canvas.winfo_height()
+    if canvas_w<=1: canvas_w=580
+    if canvas_h<=1: canvas_h=150
+    view_orig_x_canvas=canvas_w/2.0; view_orig_y_canvas=canvas_h/2.0
+    eff_pan_x=composite_pan_offset_x*composite_zoom_level; eff_pan_y=composite_pan_offset_y*composite_zoom_level
+    for el_data in composite_elements:
+        screen_x=view_orig_x_canvas-eff_pan_x+(el_data['original_x']*composite_zoom_level)
+        screen_y=view_orig_y_canvas-eff_pan_y+(el_data['original_y']*composite_zoom_level)
+        el_data['current_x_on_canvas']=screen_x; el_data['current_y_on_canvas']=screen_y
+        if el_data.get('type')=="text":
+            base_font_sz=el_data.get('base_font_size',DEFAULT_TEXT_BASE_FONT_SIZE) 
+            zoomed_font_sz=max(1,int(base_font_sz*composite_zoom_level))
+            font_fam=el_data.get('font_family',DEFAULT_TEXT_FONT_FAMILY); text_col=DEFAULT_TEXT_COLOR_FALLBACK
+            color_label_key=el_data.get('color_offset_label')
+            if color_label_key and color_label_key in colors and hasattr(root,'color_vars'):
+                color_json_key_tuple=tuple(colors[color_label_key])
+                if color_json_key_tuple in root.color_vars:
+                    current_hex_val=root.color_vars[color_json_key_tuple].get()
+                    if current_hex_val and current_hex_val.startswith("#") and len(current_hex_val)==7: text_col=current_hex_val
+                    else: logging.warning(f"Invalid hex '{current_hex_val}' for '{color_label_key}'.")
+                else: logging.warning(f"Var for key {color_json_key_tuple} ({color_label_key}) not in root.color_vars.")
+            elif color_label_key: logging.warning(f"Color label '{color_label_key}' not in 'colors' dict.")
+            item_id=preview_canvas.create_text(int(screen_x),int(screen_y),anchor=tk.NW,text=el_data['text_content'],
+                                                 font=(font_fam,zoomed_font_sz,"bold"),fill=text_col,
+                                                 tags=("composite_item",el_data['display_tag']))
+            el_data['canvas_id']=item_id
+        elif el_data.get('type')=="image":
+            pil_img_obj=el_data['pil_image']
+            zoomed_w_img=int(pil_img_obj.width*composite_zoom_level); zoomed_h_img=int(pil_img_obj.height*composite_zoom_level)
+            if zoomed_w_img<=0 or zoomed_h_img<=0: continue
+            try:
+                resized_pil=pil_img_obj.resize((zoomed_w_img,zoomed_h_img),Image.LANCZOS)
+                el_data['tk_image_ref']=ImageTk.PhotoImage(resized_pil)
+                item_id=preview_canvas.create_image(int(screen_x),int(screen_y),anchor=tk.NW,
+                                                      image=el_data['tk_image_ref'],tags=("composite_item",el_data['display_tag']))
+                el_data['canvas_id']=item_id
+            except Exception as e_redraw_img: logging.error(f"Redraw img {el_data.get('display_tag')}: {e_redraw_img}")
+        else: logging.warning(f"Unknown element type: {el_data.get('type')}")
+
+def display_composite_view():
+    global composite_elements,preview_canvas,file_path,composite_mode_active,initial_text_elements_config,predefined_image_coords,offsets,root,current_reference_width,current_reference_height
+    logging.info("Attempting display_composite_view.")
+    if not file_path: composite_mode_active=False; return
+    preview_canvas.config(bg="gray70")
+    try:
+        big_file=FifaBigFile(file_path)
+        if current_reference_width is None or current_reference_height is None: logging.warning("Ref dims not set.")
+        canvas_w=preview_canvas.winfo_width(); canvas_h=preview_canvas.winfo_height()
+        if canvas_w<=1: canvas_w=580
+        if canvas_h<=1: canvas_h=150
+        images_to_load_cfg=[("10","10"),("14","14"),("30","30_orig"),("30","30_dup")]
+        source_dds_entries={e.name:e for e in big_file.entries if e.name in [c[0] for c in images_to_load_cfg] and e.file_type=="DDS" and e.data}
+        temp_composite_elements_map:Dict[str,Dict[str,Any]]={}
+        for big_name,disp_tag_suffix in images_to_load_cfg:
+            if big_name not in source_dds_entries: logging.warning(f"Img '{big_name}' not found."); continue
+            source_entry=source_dds_entries[big_name]; current_img_tag=f"img_{disp_tag_suffix}"
+            img_cfg=predefined_image_coords.get(current_img_tag)
+            if not img_cfg: logging.error(f"No predefined_image_coords for {current_img_tag}."); continue
+            gui_ref_x,gui_ref_y,x_off_lbl,base_gx,y_off_lbl,base_gy = img_cfg
+            temp_dds_path=None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False,suffix=".dds") as tmp_f: tmp_f.write(source_entry.data);temp_dds_path=tmp_f.name
+                pil_img=Image.open(temp_dds_path).convert("RGBA")
+                vis_x=float(gui_ref_x);vis_y=float(gui_ref_y);link_x_var=None;link_y_var=None
+                if x_off_lbl and y_off_lbl and base_gx is not None and base_gy is not None and hasattr(root,'offsets_vars') and offsets:
+                    if x_off_lbl in offsets and y_off_lbl in offsets:
+                        x_key=tuple(offsets[x_off_lbl]);y_key=tuple(offsets[y_off_lbl])
+                        if x_key in root.offsets_vars and y_key in root.offsets_vars:
+                            link_x_var=root.offsets_vars[x_key];link_y_var=root.offsets_vars[y_key]
+                            try:
+                                cur_gx=float(link_x_var.get());cur_gy=float(link_y_var.get())
+                                dev_x=cur_gx-base_gx;dev_y=cur_gy-base_gy
+                                vis_x=float(gui_ref_x)+dev_x;vis_y=float(gui_ref_y)+dev_y
+                            except ValueError: link_x_var=None;link_y_var=None 
+                is_fixed=(current_img_tag=="img_10")
+                img_el_data={'type':"image",'pil_image':pil_img,'original_x':vis_x,'original_y':vis_y,
+                             'image_name_in_big':source_entry.name,'display_tag':current_img_tag,
+                             'tk_image_ref':None,'canvas_id':None,'is_fixed':is_fixed,
+                             'x_offset_label_linked':x_off_lbl,'y_offset_label_linked':y_off_lbl,
+                             'x_var_linked':link_x_var,'y_var_linked':link_y_var,
+                             'base_game_x':base_gx,'base_game_y':base_gy,'gui_ref_x':gui_ref_x,'gui_ref_y':gui_ref_y}
+                temp_composite_elements_map[current_img_tag]=img_el_data
+            except Exception as e_img_prep: logging.error(f"Error prep img {current_img_tag}: {e_img_prep}",exc_info=True)
+            finally:
+                if temp_dds_path and os.path.exists(temp_dds_path): os.remove(temp_dds_path)
         
-    if file_path: # Only refresh if a file is loaded
-        extract_and_display_texture()
+        for config_tuple in initial_text_elements_config:
+            tag_cfg,txt_cfg,gui_x,gui_y,design_font_size_cfg,font_size_label_cfg, \
+            color_label_cfg,is_fixed_cfg,x_off_lbl,base_gx,y_off_lbl,base_gy = config_tuple
 
+            vis_x=float(gui_x);vis_y=float(gui_y);link_x_var=None;link_y_var=None
+            current_gui_render_font_size = float(design_font_size_cfg) 
 
-# --- UI Setup ---
-root = tk.Tk()
-root.title("FLP Scoreboard Editor 25 (v1.0)")
-root.geometry("930x710")
-root.resizable(False, False)
+            if x_off_lbl and y_off_lbl and base_gx is not None and base_gy is not None and hasattr(root,'offsets_vars') and offsets:
+                if x_off_lbl in offsets and y_off_lbl in offsets:
+                    x_key=tuple(offsets[x_off_lbl]);y_key=tuple(offsets[y_off_lbl])
+                    if x_key in root.offsets_vars and y_key in root.offsets_vars:
+                        link_x_var=root.offsets_vars[x_key];link_y_var=root.offsets_vars[y_key]
+                        try:
+                            cur_gx=float(link_x_var.get());cur_gy=float(link_y_var.get())
+                            dev_x=cur_gx-base_gx;dev_y=cur_gy-base_gy
+                            vis_x=float(gui_x)+dev_x;vis_y=float(gui_y)+dev_y
+                        except ValueError: link_x_var=None;link_y_var=None
+            
+            font_size_var_linked = None 
+            if font_size_label_cfg and font_size_label_cfg != "PlaceHolder" and font_size_label_cfg in offsets and hasattr(root, 'offsets_vars'):
+                font_size_key_tuple = tuple(offsets[font_size_label_cfg])
+                if font_size_key_tuple in root.offsets_vars:
+                    font_size_var_linked = root.offsets_vars[font_size_key_tuple]
+                    try:
+                        game_font_size_val = float(font_size_var_linked.get())
+                        current_gui_render_font_size = game_font_size_val / 1.5 
+                        logging.info(f"Comp: Initial font for '{tag_cfg}' (linked to '{font_size_label_cfg}') "
+                                     f"game_val: {game_font_size_val} -> GUI render size: {current_gui_render_font_size:.2f}")
+                    except ValueError:
+                        logging.warning(f"Non-float value for font size offset '{font_size_label_cfg}' for text element '{tag_cfg}'. "
+                                        f"Using design size {design_font_size_cfg}.")
+            elif font_size_label_cfg == "PlaceHolder":
+                 logging.info(f"Comp: Font size for '{tag_cfg}' uses design size {design_font_size_cfg} due to 'PlaceHolder' link.")
+            
+            txt_el_data={'type':"text",'text_content':txt_cfg,'original_x':vis_x,'original_y':vis_y,
+                         'base_font_size':current_gui_render_font_size, 
+                         'font_size_offset_label_linked': font_size_label_cfg, 
+                         'font_size_var_linked': font_size_var_linked, 
+                         'font_family':DEFAULT_TEXT_FONT_FAMILY,'color_offset_label':color_label_cfg,
+                         'display_tag':tag_cfg,'canvas_id':None,'is_fixed':is_fixed_cfg,
+                         'x_offset_label_linked':x_off_lbl,'y_offset_label_linked':y_off_lbl,
+                         'x_var_linked':link_x_var,'y_var_linked':link_y_var,
+                         'base_game_x':base_gx,'base_game_y':base_gy,'gui_ref_x':gui_x,'gui_ref_y':gui_y}
+            temp_composite_elements_map[tag_cfg]=txt_el_data
+        
+        leader_tag="text_added_time";follower_tag="img_14"
+        if leader_tag in temp_composite_elements_map and follower_tag in temp_composite_elements_map:
+            leader_el=temp_composite_elements_map[leader_tag];follower_el=temp_composite_elements_map[follower_tag]
+            img14_gui_x_abs=predefined_image_coords[follower_tag][0];img14_gui_y_abs=predefined_image_coords[follower_tag][1]
+            txt_add_time_cfg=next(item for item in initial_text_elements_config if item[0]==leader_tag)
+            txt_add_time_gui_x_abs=txt_add_time_cfg[2];txt_add_time_gui_y_abs=txt_add_time_cfg[3]
+            rel_off_x=img14_gui_x_abs-txt_add_time_gui_x_abs;rel_off_y=img14_gui_y_abs-txt_add_time_gui_y_abs
+            follower_el['original_x']=leader_el['original_x']+rel_off_x;follower_el['original_y']=leader_el['original_y']+rel_off_y
+            follower_el['conjoined_to_tag']=leader_tag;follower_el['relative_offset_x']=rel_off_x
+            follower_el['relative_offset_y']=rel_off_y;follower_el['is_fixed']=True
+        composite_elements=list(temp_composite_elements_map.values());redraw_composite_view()
+        texture_label.config(text="Composite Mode Active")
+        image_dimensions_label.config(text=f"Canvas: {canvas_w}x{canvas_h} | Ref: {current_reference_width or 'N/A'}x{current_reference_height or 'N/A'}")
+    except Exception as e_comp_disp:
+        messagebox.showerror("Composite Err",f"Display fail: {e_comp_disp}");logging.error(f"CRITICAL Comp display error: {e_comp_disp}",exc_info=True)
+        composite_mode_active=False;toggle_composite_mode()
 
-menubar = tk.Menu(root)
-filemenu = tk.Menu(menubar, tearoff=0)
-filemenu.add_command(label="Open", command=open_file        , accelerator="Ctrl+O")
-filemenu.add_command(label="Save", command=save_file        , accelerator="Ctrl+S")
-filemenu.add_separator()
-filemenu.add_command(label="Exit", command=exit_app)
-menubar.add_cascade(label="File", menu=filemenu)
-root.bind_all("<Control-o>", lambda event: open_file())
-root.bind_all("<Control-s>", lambda event: save_file())
+def zoom_composite_view(event):
+    global composite_zoom_level,composite_pan_offset_x,composite_pan_offset_y,preview_canvas
+    if not composite_elements: return
+    factor=1.1 if event.delta>0 else (1/1.1); new_zoom=max(0.05,min(composite_zoom_level*factor,10.0))
+    canvas_w=preview_canvas.winfo_width(); canvas_h=preview_canvas.winfo_height()
+    mouse_x_center=event.x-(canvas_w/2.0); mouse_y_center=event.y-(canvas_h/2.0)
+    if abs(composite_zoom_level)>1e-6 and abs(new_zoom)>1e-6:
+        pan_adj_x=mouse_x_center*((1.0/composite_zoom_level)-(1.0/new_zoom))
+        pan_adj_y=mouse_y_center*((1.0/composite_zoom_level)-(1.0/new_zoom))
+        composite_pan_offset_x+=pan_adj_x; composite_pan_offset_y+=pan_adj_y
+    composite_zoom_level=new_zoom; redraw_composite_view()
 
-helpmenu = tk.Menu(menubar, tearoff=0)
-helpmenu.add_command(label="About", command=about)
-helpmenu.add_separator()
-helpmenu.add_command(label="Documentation", command=show_documentation)
-menubar.add_cascade(label="Help", menu=helpmenu)
-root.config(menu=menubar)
+def start_pan_composite(event):
+    global drag_data; drag_data["is_panning_rmb"]=True; drag_data["x"]=event.x; drag_data["y"]=event.y
+    logging.debug(f"Comp RMB Pan start ({event.x},{event.y})")
 
-notebook = ttk.Notebook(root)
-positions_frame = ttk.Frame(notebook)
-sizes_frame = ttk.Frame(notebook)
-colors_frame = ttk.Frame(notebook)
-notebook.add(positions_frame, text="Positions")
-notebook.add(sizes_frame, text="Sizes")
-notebook.add(colors_frame, text="Colors")
-notebook.pack(expand=1, fill="both", padx=10, pady=5)
+def on_pan_composite(event):
+    global drag_data,composite_pan_offset_x,composite_pan_offset_y,composite_zoom_level
+    if not drag_data.get("is_panning_rmb"): return
+    dx_canvas=event.x-drag_data["x"]; dy_canvas=event.y-drag_data["y"]
+    if abs(composite_zoom_level)>1e-6:
+        delta_orig_x=dx_canvas/composite_zoom_level; delta_orig_y=dy_canvas/composite_zoom_level
+        composite_pan_offset_x-=delta_orig_x; composite_pan_offset_y-=delta_orig_y
+    drag_data["x"]=event.x; drag_data["y"]=event.y; redraw_composite_view()
 
-preview_controls_frame = tk.Frame(root)
-preview_controls_frame.pack(fill=tk.X, padx=10, pady=5)
+def start_drag_composite(event):
+    global composite_drag_data,composite_elements,drag_data,highlighted_offset_entries,offsets,root
+    clear_all_highlights()
+    if event.num==3: start_pan_composite(event); return
+    drag_data["is_panning"]=False; drag_data["is_panning_rmb"]=False
+    item_tuple=event.widget.find_closest(event.x,event.y)
+    if not item_tuple: composite_drag_data['item']=None; return
+    item_id=item_tuple[0]
+    if "composite_item" not in preview_canvas.gettags(item_id): composite_drag_data['item']=None; return
+    for el_data in composite_elements:
+        if el_data.get('canvas_id')==item_id:
+            if el_data.get('is_fixed',False):
+                logging.info(f"Attempt drag fixed: {el_data.get('display_tag')}"); composite_drag_data['item']=None; return
+            initial_gx,initial_gy=0.0,0.0
+            x_var=el_data.get('x_var_linked'); y_var=el_data.get('y_var_linked')
+            if x_var and y_var:
+                try: initial_gx=float(x_var.get()); initial_gy=float(y_var.get())
+                except ValueError: logging.warning(f"Could not parse initial game offsets for {el_data.get('display_tag')}.")
+            composite_drag_data.update({'item':item_id,'x':event.x,'y':event.y,'element_data':el_data,
+                                        'start_original_x':el_data['original_x'],'start_original_y':el_data['original_y'],
+                                        'initial_game_offset_x_at_drag_start':initial_gx,
+                                        'initial_game_offset_y_at_drag_start':initial_gy})
+            preview_canvas.tag_raise(item_id)
+            x_label=el_data.get('x_offset_label_linked'); y_label=el_data.get('y_offset_label_linked')
+            font_size_label = el_data.get('font_size_offset_label_linked')
 
-left_arrow_button = ttk.Button(preview_controls_frame, text="◀", command=previous_image, width=2)
-left_arrow_button.pack(side=tk.LEFT, padx=(0,5), pady=5, anchor='center')
+            if x_label and x_label in offsets and hasattr(root,'offset_entry_widgets'):
+                x_key=tuple(offsets[x_label])
+                if x_key in root.offset_entry_widgets:
+                    entry_w=root.offset_entry_widgets[x_key]
+                    highlighted_offset_entries.append((entry_w,entry_w.cget("background"))); entry_w.config(bg="lightyellow")
+            if y_label and y_label in offsets and hasattr(root,'offset_entry_widgets'):
+                y_key=tuple(offsets[y_label])
+                if y_key in root.offset_entry_widgets:
+                    entry_w=root.offset_entry_widgets[y_key]
+                    if not any(he[0]==entry_w for he in highlighted_offset_entries):
+                        highlighted_offset_entries.append((entry_w,entry_w.cget("background"))); entry_w.config(bg="lightyellow")
+            if font_size_label and font_size_label != "PlaceHolder" and font_size_label in offsets and el_data.get('type') == "text" and not el_data.get('is_fixed'):
+                 font_size_key = tuple(offsets[font_size_label])
+                 if font_size_key in root.offset_entry_widgets:
+                    entry_w_font = root.offset_entry_widgets[font_size_key]
+                    if not any(he[0] == entry_w_font for he in highlighted_offset_entries):
+                        highlighted_offset_entries.append((entry_w_font, entry_w_font.cget("background")))
+                        entry_w_font.config(bg="lightcyan") 
+            return
+    composite_drag_data['item']=None
 
-preview_canvas = tk.Canvas(preview_controls_frame, width=580, height=150, bg="#CCCCCC", relief="solid", bd=1)
-preview_canvas.pack(side=tk.LEFT, padx=5, pady=5, anchor='center')
-preview_canvas.bind("<MouseWheel>", zoom_image)
-preview_canvas.bind("<ButtonPress-1>", start_drag)
-preview_canvas.bind("<B1-Motion>", on_drag)
+def on_drag_composite(event):
+    global composite_drag_data,composite_zoom_level,drag_data,composite_elements,offsets,root
+    if event.num==3 or drag_data.get("is_panning_rmb"): on_pan_composite(event); return
+    if composite_drag_data.get('item') is None or drag_data.get("is_panning"): return
+    dragged_elem_data=composite_drag_data.get('element_data')
+    if not dragged_elem_data: return
+    mouse_dx_canvas=event.x-composite_drag_data['x']; mouse_dy_canvas=event.y-composite_drag_data['y']
+    if abs(composite_zoom_level)<1e-6: return
+    delta_visual_original_x=mouse_dx_canvas/composite_zoom_level; delta_visual_original_y=mouse_dy_canvas/composite_zoom_level
+    new_visual_original_x=composite_drag_data['start_original_x']+delta_visual_original_x
+    new_visual_original_y=composite_drag_data['start_original_y']+delta_visual_original_y
+    dragged_elem_data['original_x']=new_visual_original_x; dragged_elem_data['original_y']=new_visual_original_y
+    x_var_linked=dragged_elem_data.get('x_var_linked'); y_var_linked=dragged_elem_data.get('y_var_linked')
+    if x_var_linked and y_var_linked: 
+        initial_game_x=composite_drag_data['initial_game_offset_x_at_drag_start']
+        initial_game_y=composite_drag_data['initial_game_offset_y_at_drag_start']
+        new_game_offset_x=initial_game_x+delta_visual_original_x
+        new_game_offset_y=initial_game_y+delta_visual_original_y
+        old_x_str=x_var_linked.get(); old_y_str=y_var_linked.get()
+        new_x_str_val=f"{new_game_offset_x:.2f}"; new_y_str_val=f"{new_game_offset_y:.2f}"
+        x_var_linked.set(new_x_str_val); y_var_linked.set(new_y_str_val)
+        logging.info(f"Drag: Elem '{dragged_elem_data.get('display_tag')}' game offsets -> X={new_x_str_val}, Y={new_y_str_val}")
+        x_offset_label=dragged_elem_data.get('x_offset_label_linked'); y_offset_label=dragged_elem_data.get('y_offset_label_linked')
+        if x_offset_label and x_offset_label in offsets:
+            x_key_tuple=tuple(offsets[x_offset_label])
+            if old_x_str!=new_x_str_val:
+                action_x=EditAction(x_var_linked,old_x_str,new_x_str_val,x_key_tuple,root.offset_entry_widgets.get(x_key_tuple),f"Drag {dragged_elem_data.get('display_tag')} X")
+                undo_manager.record_action(action_x)
+            update_value(x_key_tuple,x_var_linked,from_undo_redo=True)
+        if y_offset_label and y_offset_label in offsets:
+            y_key_tuple=tuple(offsets[y_offset_label])
+            if old_y_str!=new_y_str_val:
+                action_y=EditAction(y_var_linked,old_y_str,new_y_str_val,y_key_tuple,root.offset_entry_widgets.get(y_key_tuple),f"Drag {dragged_elem_data.get('display_tag')} Y")
+                undo_manager.record_action(action_y)
+            update_value(y_key_tuple,y_var_linked,from_undo_redo=True)
+    dragged_tag=dragged_elem_data.get('display_tag')
+    if dragged_tag:
+        for follower_elem in composite_elements:
+            if follower_elem.get('conjoined_to_tag')==dragged_tag:
+                follower_elem['original_x']=dragged_elem_data['original_x']+follower_elem.get('relative_offset_x',0)
+                follower_elem['original_y']=dragged_elem_data['original_y']+follower_elem.get('relative_offset_y',0)
+    redraw_composite_view()
 
-right_arrow_button = ttk.Button(preview_controls_frame, text="▶", command=next_image, width=2)
-right_arrow_button.pack(side=tk.LEFT, padx=5, pady=5, anchor='center')
+def on_drag_release_composite(event):
+    global drag_data
+    if event.num==3: drag_data["is_panning_rmb"]=False; logging.debug("RMB Pan released")
 
-toggle_bg_button = ttk.Button(preview_controls_frame, text="Toggle Alpha", command=toggle_preview_background, width=12)
-toggle_bg_button.pack(side=tk.LEFT, padx=(10,0), pady=5, anchor='center')
-
-texture_info_frame = tk.Frame(root)
-texture_info_frame.pack(fill=tk.X, padx=10, pady=(0,5))
-texture_label = tk.Label(texture_info_frame, text="No texture loaded", font=('Helvetica', 9), anchor='w')
-texture_label.pack(side=tk.LEFT, padx=5)
-image_dimensions_label = tk.Label(texture_info_frame, text=" ", font=('Helvetica', 10), anchor='e')
-image_dimensions_label.pack(side=tk.RIGHT, padx=10)
-
-buttons_frame = tk.Frame(root)
-buttons_frame.place(relx=1.0, rely=1.0, anchor='se', x=-10, y=-85)
-import_button = ttk.Button(buttons_frame, text="IMPORT", command=import_texture, width=10)
+root=tk.Tk(); root.title("FLP Scoreboard Editor 25 (v1.13)"); root.geometry("930x710"); root.resizable(False,False)
+menubar=tk.Menu(root)
+filemenu=tk.Menu(menubar,tearoff=0)
+filemenu.add_command(label="Open",command=open_file,accelerator="Ctrl+O")
+filemenu.add_command(label="Save",command=save_file,accelerator="Ctrl+S")
+filemenu.add_separator(); filemenu.add_command(label="Exit",command=exit_app)
+menubar.add_cascade(label="File",menu=filemenu)
+editmenu=tk.Menu(menubar,tearoff=0)
+editmenu.add_command(label="Undo",command=lambda:undo_manager.undo(),accelerator="Ctrl+Z",state=tk.DISABLED)
+editmenu.add_command(label="Redo",command=lambda:undo_manager.redo(),accelerator="Ctrl+Y",state=tk.DISABLED)
+menubar.add_cascade(label="Edit",menu=editmenu); root.editmenu=editmenu
+helpmenu=tk.Menu(menubar,tearoff=0)
+helpmenu.add_command(label="About",command=about); helpmenu.add_separator()
+helpmenu.add_command(label="Documentation",command=show_documentation)
+menubar.add_cascade(label="Help",menu=helpmenu); root.config(menu=menubar)
+root.bind_all("<Control-o>",lambda event:open_file()); root.bind_all("<Control-s>",lambda event:save_file())
+root.bind_all("<Control-z>",lambda event:undo_manager.undo()); root.bind_all("<Control-y>",lambda event:undo_manager.redo())
+notebook=ttk.Notebook(root)
+positions_frame_container=ttk.Frame(notebook)
+positions_canvas=tk.Canvas(positions_frame_container,highlightthickness=0)
+positions_scrollbar=ttk.Scrollbar(positions_frame_container,orient="vertical",command=positions_canvas.yview)
+positions_frame=ttk.Frame(positions_canvas)
+positions_frame.bind("<Configure>",lambda e:positions_canvas.configure(scrollregion=positions_canvas.bbox("all")))
+positions_canvas.create_window((0,0),window=positions_frame,anchor="nw")
+positions_canvas.configure(yscrollcommand=positions_scrollbar.set)
+positions_canvas.pack(side="left",fill="both",expand=True); positions_scrollbar.pack(side="right",fill="y")
+notebook.add(positions_frame_container,text="Positions")
+sizes_frame=ttk.Frame(notebook); notebook.add(sizes_frame,text="Sizes")
+colors_frame=ttk.Frame(notebook); notebook.add(colors_frame,text="Colors")
+notebook.pack(expand=1,fill="both",padx=10,pady=5)
+preview_controls_frame=tk.Frame(root); preview_controls_frame.pack(fill=tk.X,padx=10,pady=5)
+left_arrow_button=ttk.Button(preview_controls_frame,text="◀",command=previous_image,width=2)
+left_arrow_button.pack(side=tk.LEFT,padx=(0,5),pady=5,anchor='center')
+preview_canvas=tk.Canvas(preview_controls_frame,width=580,height=150,bg="#CCCCCC",relief="solid",bd=1)
+preview_canvas.pack(side=tk.LEFT,padx=5,pady=5,anchor='center')
+preview_canvas.bind("<MouseWheel>",zoom_image_handler); preview_canvas.bind("<ButtonPress-1>",start_drag_handler)
+preview_canvas.bind("<B1-Motion>",on_drag_handler); preview_canvas.bind("<ButtonRelease-1>",on_drag_release_handler)
+preview_canvas.bind("<ButtonPress-3>",start_pan_composite); preview_canvas.bind("<B3-Motion>",on_pan_composite)
+preview_canvas.bind("<ButtonRelease-3>",on_drag_release_composite)
+right_arrow_button=ttk.Button(preview_controls_frame,text="▶",command=next_image,width=2)
+right_arrow_button.pack(side=tk.LEFT,padx=5,pady=5,anchor='center')
+vertical_buttons_frame=tk.Frame(preview_controls_frame)
+vertical_buttons_frame.pack(side=tk.LEFT,padx=(10,0),pady=0,anchor='n')
+toggle_bg_button=ttk.Button(vertical_buttons_frame,text="Toggle Alpha",command=toggle_preview_background,width=15)
+toggle_bg_button.pack(side=tk.TOP,pady=(5,2))
+composite_view_button=ttk.Button(vertical_buttons_frame,text="Composite View",command=toggle_composite_mode,width=15)
+composite_view_button.pack(side=tk.TOP,pady=(2,5))
+texture_info_frame=tk.Frame(root); texture_info_frame.pack(fill=tk.X,padx=10,pady=(0,5))
+texture_label=tk.Label(texture_info_frame,text="No texture loaded",font=('Helvetica',9),anchor='w')
+texture_label.pack(side=tk.LEFT,padx=5)
+image_dimensions_label=tk.Label(texture_info_frame,text=" ",font=('Helvetica',10),anchor='e')
+image_dimensions_label.pack(side=tk.RIGHT,padx=10)
+buttons_frame=tk.Frame(root); buttons_frame.place(relx=1.0,rely=1.0,anchor='se',x=-10,y=-85)
+import_button=ttk.Button(buttons_frame,text="IMPORT",command=import_texture,width=10)
 import_button.pack(pady=2)
-export_button = ttk.Button(buttons_frame, text="EXPORT", command=export_selected_file, width=10)
+export_button=ttk.Button(buttons_frame,text="EXPORT",command=export_selected_file,width=10)
 export_button.pack(pady=2)
-save_button_main = ttk.Button(buttons_frame, text="SAVE", command=save_file, width=10)
+save_button_main=ttk.Button(buttons_frame,text="SAVE",command=save_file,width=10)
 save_button_main.pack(pady=(2,0))
-
-bottom_frame = tk.Frame(root)
-bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0,5))
-status_label = tk.Label(bottom_frame, text="Ready", anchor=tk.W, fg="blue", font=('Helvetica', 10))
-status_label.pack(side=tk.LEFT, padx=0)
-internal_name_label = tk.Label(bottom_frame, text="Internal Name: Not Loaded", anchor=tk.E, font=('Helvetica', 10))
-internal_name_label.pack(side=tk.RIGHT, padx=0)
-
-root.style = ttk.Style()
-root.style.configure('TButton', font=('Helvetica', 10), padding=3) # General TButton
-root.style.configure('Large.TButton', font=('Helvetica', 12), padding=5) # For main action buttons if needed elsewhere
-# Apply 'TButton' style to arrow and toggle buttons, 'Large.TButton' to Import/Export/Save
-left_arrow_button.configure(style='TButton')
-right_arrow_button.configure(style='TButton')
-toggle_bg_button.configure(style='TButton')
-import_button.configure(style='Large.TButton')
-export_button.configure(style='Large.TButton')
-save_button_main.configure(style='Large.TButton')
-
-
+bottom_frame=tk.Frame(root); bottom_frame.pack(side=tk.BOTTOM,fill=tk.X,padx=10,pady=(0,5))
+status_label=tk.Label(bottom_frame,text="Ready",anchor=tk.W,fg="blue",font=('Helvetica',10))
+status_label.pack(side=tk.LEFT,padx=0)
+file_path_label=tk.Label(bottom_frame,text="File: None",anchor=tk.W,font=('Helvetica',9))
+file_path_label.pack(side=tk.LEFT,padx=10)
+internal_name_label=tk.Label(bottom_frame,text="Internal Name: Not Loaded",anchor=tk.E,font=('Helvetica',10))
+internal_name_label.pack(side=tk.RIGHT,padx=0)
+root.style=ttk.Style(); root.style.configure('TButton',font=('Helvetica',10),padding=3)
+root.style.configure('Large.TButton',font=('Helvetica',12),padding=5)
+left_arrow_button.configure(style='TButton');right_arrow_button.configure(style='TButton')
+toggle_bg_button.configure(style='TButton');composite_view_button.configure(style='TButton')
+import_button.configure(style='Large.TButton');export_button.configure(style='Large.TButton');save_button_main.configure(style='Large.TButton')
 def on_map_event(event):
-    # This ensures canvas dimensions are known before first draw attempt if file is preloaded
-    # or immediately after open_file.
-    # If file_path is set, it means open_file likely completed or is in progress.
-    if file_path and not current_image: # Only if no image yet, but file is loaded
-        extract_and_display_texture()
-
-root.bind("<Map>", on_map_event, "+")
-
-# Initialize with empty editor state
-clear_editor_widgets()
-
+    if file_path and not current_image and not composite_mode_active: extract_and_display_texture()
+root.bind("<Map>",on_map_event,"+")
+clear_editor_widgets();undo_manager.update_menu_states()
+if not offsets_data: logging.critical("offsets_data not loaded. App exit."); exit()
 root.mainloop()
