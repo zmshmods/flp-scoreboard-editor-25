@@ -107,7 +107,7 @@ initial_text_elements_config = [
     ("text_time_min3",  "5", 100, 23, 20, "Time Text Size", "Time Text Color",
      False, "3rd Digit of Time (--0:--) X", -300, "3rd Digit of Time (--0:--) Y", 2),
     ("text_time_colon", ":", 116, 20, 20, "Time Text Size", "Time Text Color",
-     False, "Colon Seperator of Time (---:--) X", -290, "Colon Seperator of Time (---:--) Y", -2),
+     False, "Colon Separator of Time (---:--) X", -290, "Colon Separator of Time (---:--) Y", -2),
     ("text_time_sec1",  "3", 125, 23, 20, "Time Text Size", "Time Text Color",
      False, "4th Digit of Time (---:0-) X", -280, "4th Digit of Time (---:0-) Y", 2),
     ("text_time_sec2",  "8", 140, 23, 20, "Time Text Size", "Time Text Color",
