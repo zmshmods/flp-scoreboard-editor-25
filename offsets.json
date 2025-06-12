@@ -35,10 +35,6 @@
       "Away Team Name Size": "0xB64",
       "Home Score Size": "0xBFC",
       "Away Score Size": "0xC5C",
-      "Home Red Cards X": "0x4ACC",
-      "Home Red Cards Y": "0x4AD0",
-      "Away Red Cards X": "0x4B1C",
-      "Away Red Cards Y": "0x4B20",
       "Time Text Size": ["0xD1C", "0xD7C", "0xDDC", "0xE3C", "0xE9C", "0xEFC"]
 
     },
@@ -47,7 +43,7 @@
       "Away Team Name Color": "0xB60",
       "Home Score Color": "0xBF8",
       "Away Score Color": "0xC58",
-      "Added Time Text Color" : "0x4C423",
+      "Added Time Text Color" : "0xC4663",
       "Time Text Color": ["0xD18", "0xD78", "0xDD8", "0xE38", "0xE98", "0xEF8"]
     }
   }
